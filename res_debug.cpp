@@ -97,9 +97,10 @@
 
 #define LOG_TAG "resolv"
 
+#include "res_debug.h"
+
 #include <sys/param.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
@@ -110,8 +111,10 @@
 #include <android-base/stringprintf.h>
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <netdb.h>
+#include <netdutils/Slice.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -128,6 +131,7 @@
 #endif
 
 using android::base::StringAppendF;
+using android::netdutils::Slice;
 
 struct res_sym {
     int number;            /* Identifying number, like T_MX */
@@ -150,18 +154,21 @@ static void do_section(ns_msg* handle, ns_sect section) {
             LOG(VERBOSE) << s;
             return;
         }
+        if (rrnum == 0) {
+            int opcode = ns_msg_getflag(*handle, ns_f_opcode);
+            StringAppendF(&s, ";; %s SECTION:\n", p_section(section, opcode));
+        }
         if (section == ns_s_qd)
             StringAppendF(&s, ";;\t%s, type = %s, class = %s\n", ns_rr_name(rr),
                           p_type(ns_rr_type(rr)), p_class(ns_rr_class(rr)));
         else if (section == ns_s_ar && ns_rr_type(rr) == ns_t_opt) {
-            size_t rdatalen, ttl;
+            size_t rdatalen;
             uint16_t optcode, optlen;
 
             rdatalen = ns_rr_rdlen(rr);
-            ttl = ns_rr_ttl(rr);
-            StringAppendF(&s, "; EDNS: version: %zu, udp=%u, flags=%04zx\n", (ttl >> 16) & 0xff,
-                          ns_rr_class(rr), ttl & 0xffff);
-            const u_char* cp = ns_rr_rdata(rr);
+            StringAppendF(&s, "; EDNS: version: %" PRIu32 ", udp=%u, flags=%" PRIu32 "\n",
+                          (rr.ttl >> 16) & 0xff, ns_rr_class(rr), rr.ttl & 0xffff);
+            const uint8_t* cp = ns_rr_rdata(rr);
             while (rdatalen <= ns_rr_rdlen(rr) && rdatalen >= 4) {
                 int i;
 
@@ -203,7 +210,7 @@ static void do_section(ns_msg* handle, ns_sect section) {
             }
         } else {
             auto buf = std::make_unique<char[]>(buflen);
-            n = ns_sprintrr(handle, &rr, NULL, NULL, buf.get(), (u_int)buflen);
+            n = ns_sprintrr(handle, &rr, NULL, NULL, buf.get(), (uint32_t)buflen);
             if (n < 0) {
                 if (errno == ENOSPC) {
                     if (buflen < 131072) {
@@ -229,12 +236,12 @@ static void do_section(ns_msg* handle, ns_sect section) {
  * Print the contents of a query.
  * This is intended to be primarily a debugging routine.
  */
-void res_pquery(const u_char* msg, int len) {
+void res_pquery(const uint8_t* msg, int len) {
     if (!WOULD_LOG(VERBOSE)) return;
 
     ns_msg handle;
     int qdcount, ancount, nscount, arcount;
-    u_int opcode, rcode, id;
+    uint32_t opcode, rcode, id;
 
     if (ns_initparse(msg, len, &handle) < 0) {
         PLOG(VERBOSE) << "ns_initparse failed";
@@ -277,6 +284,9 @@ void res_pquery(const u_char* msg, int len) {
     do_section(&handle, ns_s_an);
     do_section(&handle, ns_s_ns);
     do_section(&handle, ns_s_ar);
+
+    LOG(VERBOSE) << "Hex dump:";
+    LOG(VERBOSE) << android::netdutils::toHex(Slice(const_cast<uint8_t*>(msg), len), 32);
 }
 
 /*

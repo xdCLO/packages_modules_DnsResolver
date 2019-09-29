@@ -94,8 +94,7 @@ cc_library {
         "libnetd_client_headers",
     ],
     export_include_dirs: ["include"],
-    // TODO: pie in the sky: make this code clang-tidy clean
-    tidy: false,
+
     product_variables: {
         debuggable: {
             cppflags: [
@@ -157,22 +156,23 @@ cc_test {
     srcs: [
         "tests/dns_responder/dns_responder.cpp",
         "dnsresolver_binder_test.cpp",
-        "resolver_test.cpp",
+        "resolv_integration_test.cpp",
     ],
     header_libs: [
         "libnetd_resolv_headers",
     ],
     shared_libs: [
         "libbpf_android",
-        "libbase",
         "libbinder",
         "libcrypto",
+        "liblog",
         "libnetd_client",
         "libssl",
         "libutils",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-cpp",
+        "libbase",
         "libgmock",
         "libnetd_test_dnsresponder",
         "libnetd_test_metrics_listener",
@@ -197,19 +197,23 @@ cc_test {
     //TODO:  drop root privileges and make it be an real unit test.
     defaults: ["netd_defaults"],
     srcs: [
-        "dns_tls_test.cpp",
-        "libnetd_resolv_test.cpp",
-        "res_cache_test.cpp",
+        "resolv_cache_unit_test.cpp",
+        "resolv_tls_unit_test.cpp",
+        "resolv_unit_test.cpp",
     ],
     shared_libs: [
         "libbase",
         "libcrypto",
         "libcutils",
         "libssl",
+        "libbinder_ndk",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-V2-cpp",
+        "dnsresolver_aidl_interface-V2-ndk_platform",
+        "netd_event_listener_interface-V1-ndk_platform",
         "libgmock",
+        "liblog",
         "libnetd_resolv",
         "libnetd_test_dnsresponder",
         "libnetd_test_resolv_utils",
