@@ -79,7 +79,6 @@
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <sys/uio.h>
 
 #include <arpa/inet.h>
@@ -107,14 +106,30 @@
 #include "netd_resolv/resolv.h"
 #include "netd_resolv/stats.h"
 #include "private/android_filesystem_config.h"
+#include "res_debug.h"
 #include "res_state_ext.h"
 #include "resolv_cache.h"
-#include "resolv_private.h"
 #include "stats.pb.h"
 
 // TODO: use the namespace something like android::netd_resolv for libnetd_resolv
-using namespace android::net;
+using android::net::CacheStatus;
+using android::net::DnsQueryEvent;
+using android::net::DnsTlsDispatcher;
+using android::net::DnsTlsTransport;
+using android::net::gPrivateDnsConfiguration;
+using android::net::IpVersion;
+using android::net::IV_IPV4;
+using android::net::IV_IPV6;
+using android::net::IV_UNKNOWN;
 using android::net::NetworkDnsEventReported;
+using android::net::NS_T_INVALID;
+using android::net::NsRcode;
+using android::net::NsType;
+using android::net::PrivateDnsMode;
+using android::net::PrivateDnsModes;
+using android::net::PrivateDnsStatus;
+using android::net::PROTO_TCP;
+using android::net::PROTO_UDP;
 using android::netdutils::Slice;
 using android::netdutils::Stopwatch;
 
@@ -122,10 +137,10 @@ static DnsTlsDispatcher sDnsTlsDispatcher;
 
 static int get_salen(const struct sockaddr*);
 static struct sockaddr* get_nsaddr(res_state, size_t);
-static int send_vc(res_state, res_params* params, const u_char*, int, u_char*, int, int*, int,
+static int send_vc(res_state, res_params* params, const uint8_t*, int, uint8_t*, int, int*, int,
                    time_t*, int*, int*);
-static int send_dg(res_state, res_params* params, const u_char*, int, u_char*, int, int*, int, int*,
-                   int*, time_t*, int*, int*);
+static int send_dg(res_state, res_params* params, const uint8_t*, int, uint8_t*, int, int*, int,
+                   int*, int*, time_t*, int*, int*);
 static void dump_error(const char*, const struct sockaddr*, int);
 
 static int sock_eq(struct sockaddr*, struct sockaddr*);
@@ -285,7 +300,7 @@ static void res_set_usable_server(int selectedServer, int nscount, bool usable_s
  * author:
  *	paul vixie, 29may94
  */
-static int res_ourserver_p(const res_state statp, const sockaddr* sa) {
+static int res_ourserver_p(res_state statp, const sockaddr* sa) {
     const sockaddr_in *inp, *srv;
     const sockaddr_in6 *in6p, *srv6;
     int ns;
@@ -333,8 +348,8 @@ static int res_ourserver_p(const res_state statp, const sockaddr* sa) {
  * author:
  *	paul vixie, 29may94
  */
-int res_nameinquery(const char* name, int type, int cl, const u_char* buf, const u_char* eom) {
-    const u_char* cp = buf + HFIXEDSZ;
+int res_nameinquery(const char* name, int type, int cl, const uint8_t* buf, const uint8_t* eom) {
+    const uint8_t* cp = buf + HFIXEDSZ;
     int qdcount = ntohs(((const HEADER*) (const void*) buf)->qdcount);
 
     while (qdcount-- > 0) {
@@ -363,9 +378,9 @@ int res_nameinquery(const char* name, int type, int cl, const u_char* buf, const
  * author:
  *	paul vixie, 29may94
  */
-int res_queriesmatch(const u_char* buf1, const u_char* eom1, const u_char* buf2,
-                     const u_char* eom2) {
-    const u_char* cp = buf1 + HFIXEDSZ;
+int res_queriesmatch(const uint8_t* buf1, const uint8_t* eom1, const uint8_t* buf2,
+                     const uint8_t* eom2) {
+    const uint8_t* cp = buf1 + HFIXEDSZ;
     int qdcount = ntohs(((const HEADER*) (const void*) buf1)->qdcount);
 
     if (buf1 + HFIXEDSZ > eom1 || buf2 + HFIXEDSZ > eom2) return (-1);
@@ -398,7 +413,7 @@ static DnsQueryEvent* addDnsQueryEvent(NetworkDnsEventReported* event) {
     return event->mutable_dns_query_events()->add_dns_query_event();
 }
 
-int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int anssiz, int* rcode,
+int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int anssiz, int* rcode,
               uint32_t flags) {
     int gotsomewhere, terrno, v_circuit, resplen, n;
     ResolvCacheStatus cache_status = RESOLV_CACHE_UNSUPPORTED;
@@ -536,9 +551,11 @@ int res_nsend(res_state statp, const u_char* buf, int buflen, u_char* ans, int a
             // reasonable place. In addition, maybe add stats for private DNS.
             if (!(statp->netcontext_flags & NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS)) {
                 bool fallback = false;
-                resplen = res_tls_send(statp, Slice(const_cast<u_char*>(buf), buflen),
+                resplen = res_tls_send(statp, Slice(const_cast<uint8_t*>(buf), buflen),
                                        Slice(ans, anssiz), rcode, &fallback);
                 if (resplen > 0) {
+                    LOG(DEBUG) << __func__ << ": got answer from DoT";
+                    res_pquery(ans, resplen);
                     if (cache_status == RESOLV_CACHE_NOTFOUND) {
                         resolv_cache_add(statp->netid, buf, buflen, ans, resplen);
                     }
@@ -696,7 +713,7 @@ static struct sockaddr* get_nsaddr(res_state statp, size_t n) {
     }
 }
 
-static struct timespec get_timeout(const res_state statp, const res_params* params, const int ns) {
+static struct timespec get_timeout(res_state statp, const res_params* params, const int ns) {
     int msec;
     // Legacy algorithm which scales the timeout by nameserver number.
     // For instance, with 4 nameservers: 5s, 2.5s, 5s, 10s
@@ -717,8 +734,9 @@ static struct timespec get_timeout(const res_state statp, const res_params* para
     return result;
 }
 
-static int send_vc(res_state statp, res_params* params, const u_char* buf, int buflen, u_char* ans,
-                   int anssiz, int* terrno, int ns, time_t* at, int* rcode, int* delay) {
+static int send_vc(res_state statp, res_params* params, const uint8_t* buf, int buflen,
+                   uint8_t* ans, int anssiz, int* terrno, int ns, time_t* at, int* rcode,
+                   int* delay) {
     *at = time(NULL);
     *delay = 0;
     const HEADER* hp = (const HEADER*) (const void*) buf;
@@ -727,7 +745,7 @@ static int send_vc(res_state statp, res_params* params, const u_char* buf, int b
     int nsaplen;
     int truncating, connreset, n;
     struct iovec iov[2];
-    u_char* cp;
+    uint8_t* cp;
 
     LOG(INFO) << __func__ << ": using send_vc";
 
@@ -772,9 +790,7 @@ same_ns:
                     return -1;
             }
         }
-        if (fchown(statp->_vcsock, statp->uid, -1) == -1) {
-            PLOG(WARNING) << __func__ << ": Failed to chown socket";
-        }
+        resolv_tag_socket(statp->_vcsock, statp->uid);
         if (statp->_mark != MARK_UNSET) {
             if (setsockopt(statp->_vcsock, SOL_SOCKET, SO_MARK, &statp->_mark,
                            sizeof(statp->_mark)) < 0) {
@@ -985,9 +1001,9 @@ retry:
     return n;
 }
 
-static int send_dg(res_state statp, res_params* params, const u_char* buf, int buflen, u_char* ans,
-                   int anssiz, int* terrno, int ns, int* v_circuit, int* gotsomewhere, time_t* at,
-                   int* rcode, int* delay) {
+static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int buflen,
+                   uint8_t* ans, int anssiz, int* terrno, int ns, int* v_circuit, int* gotsomewhere,
+                   time_t* at, int* rcode, int* delay) {
     *at = time(NULL);
     *delay = 0;
     const HEADER* hp = (const HEADER*) (const void*) buf;
@@ -1017,9 +1033,7 @@ static int send_dg(res_state statp, res_params* params, const u_char* buf, int b
             }
         }
 
-        if (fchown(statp->_u._ext.nssocks[ns], statp->uid, -1) == -1) {
-            PLOG(WARNING) << __func__ << ": Failed to chown socket";
-        }
+        resolv_tag_socket(statp->_u._ext.nssocks[ns], statp->uid);
         if (statp->_mark != MARK_UNSET) {
             if (setsockopt(statp->_u._ext.nssocks[ns], SOL_SOCKET, SO_MARK, &(statp->_mark),
                            sizeof(statp->_mark)) < 0) {

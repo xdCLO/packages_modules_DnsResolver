@@ -61,6 +61,7 @@
 #include <string>
 #include <vector>
 
+#include "DnsResolver.h"
 #include "netd_resolv/params.h"
 #include "netd_resolv/resolv.h"
 #include "netd_resolv/stats.h"
@@ -88,11 +89,10 @@ struct res_state_ext;
 struct __res_state {
     unsigned netid;                           // NetId: cache key and socket mark
     uid_t uid;                                // uid of the app that sent the DNS lookup
-    u_long options;                           // option flags - see below.
     int nscount;                              // number of name srvers
     struct sockaddr_in nsaddr_list[MAXNS];    // address of name server
 #define nsaddr nsaddr_list[0]                 // for backward compatibility
-    u_short id;                               // current message id
+    uint16_t id;                              // current message id
     std::vector<std::string> search_domains;  // domains to search
     unsigned ndots : 4;                       // threshold for initial abs. query
     unsigned nsort : 4;                       // number of elements in sort_list[]
@@ -103,8 +103,8 @@ struct __res_state {
     } sort_list[MAXRESOLVSORT];
     unsigned _mark;       /* If non-0 SET_MARK to _mark on all request sockets */
     int _vcsock;          /* PRIVATE: for res_send VC i/o */
-    u_int _flags;         /* PRIVATE: see below */
-    u_int _pad;           /* make _u 64 bit aligned */
+    uint32_t _flags;      /* PRIVATE: see below */
+    uint32_t _pad;        /* make _u 64 bit aligned */
     union {
         /* On an 32-bit arch this means 512b total. */
         char pad[72 - 4 * sizeof(int) - 2 * sizeof(void*)];
@@ -171,31 +171,23 @@ int res_hnok(const char*);
 int res_ownok(const char*);
 int res_mailok(const char*);
 int res_dnok(const char*);
-int dn_skipname(const u_char*, const u_char*);
-void putlong(uint32_t, u_char*);
-void putshort(uint16_t, u_char*);
+int dn_skipname(const uint8_t*, const uint8_t*);
+void putlong(uint32_t, uint8_t*);
+void putshort(uint16_t, uint8_t*);
 
-// Thread-unsafe functions returning pointers to static buffers :-(
-// TODO: switch all res_debug to std::string
-const char* p_class(int);
-const char* p_type(int);
-const char* p_rcode(int);
-const char* p_section(int, int);
-
-int res_nameinquery(const char*, int, int, const u_char*, const u_char*);
-int res_queriesmatch(const u_char*, const u_char*, const u_char*, const u_char*);
+int res_nameinquery(const char*, int, int, const uint8_t*, const uint8_t*);
+int res_queriesmatch(const uint8_t*, const uint8_t*, const uint8_t*, const uint8_t*);
 /* Things involving a resolver context. */
 int res_ninit(res_state);
-void res_pquery(const u_char*, int);
 
-int res_nquery(res_state, const char*, int, int, u_char*, int, int*);
-int res_nsearch(res_state, const char*, int, int, u_char*, int, int*);
-int res_nquerydomain(res_state, const char*, const char*, int, int, u_char*, int, int*);
-int res_nmkquery(res_state, int, const char*, int, int, const u_char*, int, const u_char*, u_char*,
-                 int);
-int res_nsend(res_state, const u_char*, int, u_char*, int, int*, uint32_t);
+int res_nquery(res_state, const char*, int, int, uint8_t*, int, int*);
+int res_nsearch(res_state, const char*, int, int, uint8_t*, int, int*);
+int res_nquerydomain(res_state, const char*, const char*, int, int, uint8_t*, int, int*);
+int res_nmkquery(res_state, int, const char*, int, int, const uint8_t*, int, const uint8_t*,
+                 uint8_t*, int);
+int res_nsend(res_state, const uint8_t*, int, uint8_t*, int, int*, uint32_t);
 void res_nclose(res_state);
-int res_nopt(res_state, int, u_char*, int, int);
+int res_nopt(res_state, int, uint8_t*, int, int);
 void res_ndestroy(res_state);
 void res_setservers(res_state, const sockaddr_union*, int);
 int res_getservers(res_state, sockaddr_union*, int);
@@ -224,5 +216,17 @@ Dest saturate_cast(int64_t x) {
 android::net::NsType getQueryType(const uint8_t* msg, size_t msgLen);
 
 android::net::IpVersion ipFamilyToIPVersion(int ipFamily);
+
+inline void resolv_tag_socket(int sock, uid_t uid) {
+    if (android::net::gResNetdCallbacks.tagSocket != nullptr) {
+        if (int err = android::net::gResNetdCallbacks.tagSocket(sock, TAG_SYSTEM_DNS, uid)) {
+            LOG(WARNING) << "Failed to tag socket: " << strerror(-err);
+        }
+    }
+
+    if (fchown(sock, uid, -1) == -1) {
+        LOG(WARNING) << "Failed to chown socket: " << strerror(errno);
+    }
+}
 
 #endif  // NETD_RESOLV_PRIVATE_H
