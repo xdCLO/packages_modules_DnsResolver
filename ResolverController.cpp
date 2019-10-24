@@ -210,9 +210,9 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
     if (tlsServers.size() > MAXNS) {
         tlsServers.resize(MAXNS);
     }
-    const int err =
-            gPrivateDnsConfiguration.set(resolverParams.netId, fwmark.intValue, tlsServers,
-                                         resolverParams.tlsName, resolverParams.caCertificate);
+    const int err = gPrivateDnsConfiguration.set(
+            resolverParams.netId, fwmark.intValue, tlsServers, resolverParams.tlsName,
+            resolverParams.caCertificate, resolverParams.tlsConnectTimeoutMs);
 
     if (err != 0) {
         return err;
@@ -226,8 +226,8 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
     res_params.base_timeout_msec = resolverParams.baseTimeoutMsec;
     res_params.retry_count = resolverParams.retryCount;
 
-    return -resolv_set_nameservers(resolverParams.netId, resolverParams.servers,
-                                   resolverParams.domains, res_params);
+    return resolv_set_nameservers(resolverParams.netId, resolverParams.servers,
+                                  resolverParams.domains, res_params);
 }
 
 int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>* servers,
@@ -356,6 +356,7 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
             dw.decIndent();
         }
         dw.println("Concurrent DNS query timeout: %d", wait_for_pending_req_timeout_count[0]);
+        resolv_stats_dump(dw, netId);
     }
     dw.decIndent();
 }

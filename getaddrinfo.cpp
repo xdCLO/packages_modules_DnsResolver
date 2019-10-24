@@ -56,6 +56,7 @@
 #include <android-base/logging.h>
 
 #include "netd_resolv/resolv.h"
+#include "res_init.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
 
@@ -265,6 +266,7 @@ int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hin
             .dns_netid = NETID_UNSET,
             .dns_mark = MARK_UNSET,
             .uid = NET_CONTEXT_INVALID_UID,
+            .pid = NET_CONTEXT_INVALID_PID,
     };
     NetworkDnsEventReported event;
     return android_getaddrinfofornetcontext(hostname, servname, &hints, &netcontext, result,
@@ -1445,18 +1447,11 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
             return EAI_FAMILY;
     }
 
-    res_state res = res_get_state();
-    if (!res) return EAI_MEMORY;
-
-    /* this just sets our netid val in the thread private data so we don't have to
-     * modify the api's all the way down to res_send.c's res_nsend.  We could
-     * fully populate the thread private data here, but if we get down there
-     * and have a cache hit that would be wasted, so we do the rest there on miss
-     */
-    res_setnetcontext(res, netcontext, event);
+    ResState res;
+    res_init(&res, netcontext, event);
 
     int he;
-    if (res_searchN(name, &q, res, &he) < 0) {
+    if (res_searchN(name, &q, &res, &he) < 0) {
         // Return h_errno (he) to catch more detailed errors rather than EAI_NODATA.
         // Note that res_searchN() doesn't set the pair NETDB_INTERNAL and errno.
         // See also herrnoToAiErrno().
@@ -1612,7 +1607,8 @@ static int res_queryN(const char* name, res_target* target, res_state res, int* 
 
         LOG(DEBUG) << __func__ << ": (" << cl << ", " << type << ")";
 
-        n = res_nmkquery(res, QUERY, name, cl, type, NULL, 0, NULL, buf, sizeof(buf));
+        n = res_nmkquery(QUERY, name, cl, type, /*data=*/nullptr, /*datalen=*/0, buf, sizeof(buf),
+                         res->netcontext_flags);
         if (n > 0 &&
             (res->netcontext_flags &
              (NET_CONTEXT_FLAG_USE_DNS_OVER_TLS | NET_CONTEXT_FLAG_USE_EDNS)) &&

@@ -164,7 +164,10 @@ bool DnsTlsFrontend::startServer() {
 
     // Set up TCP server socket for clients.
     addrinfo frontend_ai_hints{
-            .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_flags = AI_PASSIVE};
+            .ai_flags = AI_PASSIVE,
+            .ai_family = AF_UNSPEC,
+            .ai_socktype = SOCK_STREAM,
+    };
     addrinfo* frontend_ai_res = nullptr;
     int rv = getaddrinfo(listen_address_.c_str(), listen_service_.c_str(), &frontend_ai_hints,
                          &frontend_ai_res);
@@ -241,6 +244,7 @@ void DnsTlsFrontend::requestHandler() {
     enum { EVENT_FD = 0, LISTEN_FD = 1 };
     pollfd fds[2] = {{.fd = event_fd_.get(), .events = POLLIN},
                      {.fd = socket_.get(), .events = POLLIN}};
+    android::base::unique_fd clientFd;
 
     while (true) {
         int poll_code = poll(fds, std::size(fds), -1);
@@ -264,6 +268,14 @@ void DnsTlsFrontend::requestHandler() {
                 // Stop
                 PLOG(INFO) << "failed to accept client socket " << client.get();
                 break;
+            }
+
+            if (hangOnHandshake_) {
+                LOG(DEBUG) << "TEST ONLY: unresponsive to SSL handshake";
+
+                // The previous fd already stored in clientFd will be closed automatically.
+                clientFd = std::move(client);
+                continue;
             }
 
             bssl::UniquePtr<SSL> ssl(SSL_new(ctx_.get()));
