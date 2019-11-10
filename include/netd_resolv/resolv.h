@@ -30,6 +30,7 @@
 
 #include "params.h"
 
+#include <arpa/nameser.h>
 #include <netinet/in.h>
 
 /*
@@ -43,12 +44,8 @@
  */
 #define MARK_UNSET 0u
 
-/*
- * Error code extending EAI_* codes defined in bionic/libc/include/netdb.h.
- * This error code, including EAI_*, returned from android_getaddrinfofornetcontext()
- * and android_gethostbynamefornetcontext() are used for DNS metrics.
- */
-#define NETD_RESOLV_TIMEOUT 255  // consistent with RCODE_TIMEOUT
+#define NET_CONTEXT_INVALID_UID ((uid_t)-1)
+#define NET_CONTEXT_INVALID_PID ((pid_t)-1)
 
 /*
  * A struct to capture context relevant to network operations.
@@ -66,11 +63,12 @@ struct android_net_context {
     unsigned app_mark;
     unsigned dns_netid;
     unsigned dns_mark;
-    uid_t uid;
+    uid_t uid = NET_CONTEXT_INVALID_UID;
     unsigned flags;
+    // Variable to store the pid of the application sending DNS query.
+    pid_t pid = NET_CONTEXT_INVALID_PID;
 };
 
-#define NET_CONTEXT_INVALID_UID ((uid_t) -1)
 #define NET_CONTEXT_FLAG_USE_LOCAL_NAMESERVERS 0x00000001
 #define NET_CONTEXT_FLAG_USE_EDNS 0x00000002
 #define NET_CONTEXT_FLAG_USE_DNS_OVER_TLS 0x00000004
@@ -81,7 +79,7 @@ typedef bool (*check_calling_permission_callback)(const char* permission);
 typedef void (*get_network_context_callback)(unsigned netid, uid_t uid,
                                              android_net_context* netcontext);
 typedef void (*log_callback)(const char* msg);
-typedef int (*tagSocketCallback)(int sockFd, uint32_t tag, uid_t uid);
+typedef int (*tagSocketCallback)(int sockFd, uint32_t tag, uid_t uid, pid_t pid);
 
 /*
  * Some functions needed by the resolver (e.g. checkCallingPermission()) live in
@@ -102,3 +100,10 @@ LIBNETD_RESOLV_PUBLIC bool resolv_has_nameservers(unsigned netid);
 
 // Set callbacks and bring DnsResolver up.
 LIBNETD_RESOLV_PUBLIC bool resolv_init(const ResolverNetdCallbacks* callbacks);
+
+// Function that performs RDNS in local cache. The |domain_name_size| is the size of domain_name
+// buffer, which is recommended to NS_MAXDNAME. Function return false if hostname not found or
+// domain_name_size > NS_MAXDNAME.
+LIBNETD_RESOLV_PUBLIC bool resolv_gethostbyaddr_from_local_cache(unsigned netId, char domain_name[],
+                                                                 unsigned domain_name_size,
+                                                                 char* ip_address);

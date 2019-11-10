@@ -38,6 +38,7 @@
 #include <netdutils/SocketOption.h>
 #include <netdutils/ThreadUtil.h>
 
+#include "netd_resolv/resolv.h"
 #include "private/android_filesystem_config.h"  // AID_DNS
 #include "resolv_private.h"
 
@@ -59,16 +60,14 @@ namespace {
 
 constexpr const char kCaCertDir[] = "/system/etc/security/cacerts";
 
-int waitForReading(int fd) {
-    struct pollfd fds = { .fd = fd, .events = POLLIN };
-    const int ret = TEMP_FAILURE_RETRY(poll(&fds, 1, -1));
-    return ret;
+int waitForReading(int fd, int timeoutMs = -1) {
+    pollfd fds = {.fd = fd, .events = POLLIN};
+    return TEMP_FAILURE_RETRY(poll(&fds, 1, timeoutMs));
 }
 
-int waitForWriting(int fd) {
-    struct pollfd fds = { .fd = fd, .events = POLLOUT };
-    const int ret = TEMP_FAILURE_RETRY(poll(&fds, 1, -1));
-    return ret;
+int waitForWriting(int fd, int timeoutMs = -1) {
+    pollfd fds = {.fd = fd, .events = POLLOUT};
+    return TEMP_FAILURE_RETRY(poll(&fds, 1, timeoutMs));
 }
 
 std::string markToFwmarkString(unsigned mMark) {
@@ -97,7 +96,7 @@ Status DnsTlsSocket::tcpConnect() {
         return Status(errno);
     }
 
-    resolv_tag_socket(mSslFd.get(), AID_DNS);
+    resolv_tag_socket(mSslFd.get(), AID_DNS, NET_CONTEXT_INVALID_PID);
 
     const socklen_t len = sizeof(mMark);
     if (setsockopt(mSslFd.get(), SOL_SOCKET, SO_MARK, &mMark, len) == -1) {
@@ -250,14 +249,21 @@ bssl::UniquePtr<SSL> DnsTlsSocket::sslConnect(int fd) {
         const int ssl_err = SSL_get_error(ssl.get(), ret);
         switch (ssl_err) {
             case SSL_ERROR_WANT_READ:
-                if (waitForReading(fd) != 1) {
-                    PLOG(WARNING) << "SSL_connect read error, " << markToFwmarkString(mMark);
+                // SSL_ERROR_WANT_READ is returned because the application data has been sent during
+                // the TCP connection handshake, the device is waiting for the SSL handshake reply
+                // from the server.
+                if (int err = waitForReading(fd, mServer.connectTimeout.count()); err <= 0) {
+                    PLOG(WARNING) << "SSL_connect read error " << err << ", "
+                                  << markToFwmarkString(mMark);
                     return nullptr;
                 }
                 break;
             case SSL_ERROR_WANT_WRITE:
-                if (waitForWriting(fd) != 1) {
-                    PLOG(WARNING) << "SSL_connect write error, " << markToFwmarkString(mMark);
+                // If no application data is sent during the TCP connection handshake, the
+                // device is waiting for the connection established to perform SSL handshake.
+                if (int err = waitForWriting(fd, mServer.connectTimeout.count()); err <= 0) {
+                    PLOG(WARNING) << "SSL_connect write error " << err << ", "
+                                  << markToFwmarkString(mMark);
                     return nullptr;
                 }
                 break;
@@ -291,8 +297,8 @@ bool DnsTlsSocket::sslWrite(const Slice buffer) {
             const int ssl_err = SSL_get_error(mSsl.get(), ret);
             switch (ssl_err) {
                 case SSL_ERROR_WANT_WRITE:
-                    if (waitForWriting(mSslFd.get()) != 1) {
-                        LOG(DEBUG) << "SSL_write error";
+                    if (int err = waitForWriting(mSslFd.get()); err <= 0) {
+                        PLOG(WARNING) << "Poll failed in sslWrite, error " << err;
                         return false;
                     }
                     continue;
@@ -462,8 +468,8 @@ int DnsTlsSocket::sslRead(const Slice buffer, bool wait) {
         if (ret < 0) {
             const int ssl_err = SSL_get_error(mSsl.get(), ret);
             if (wait && ssl_err == SSL_ERROR_WANT_READ) {
-                if (waitForReading(mSslFd.get()) != 1) {
-                    LOG(DEBUG) << "Poll failed in sslRead: " << errno;
+                if (int err = waitForReading(mSslFd.get()); err <= 0) {
+                    PLOG(WARNING) << "Poll failed in sslRead, error " << err;
                     return SSL_ERROR_SYSCALL;
                 }
                 continue;

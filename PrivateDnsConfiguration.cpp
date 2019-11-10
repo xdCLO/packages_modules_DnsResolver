@@ -28,6 +28,9 @@
 #include "ResolverEventReporter.h"
 #include "netd_resolv/resolv.h"
 #include "netdutils/BackoffSequence.h"
+#include "resolv_cache.h"
+
+using std::chrono::milliseconds;
 
 namespace android {
 namespace net {
@@ -40,7 +43,10 @@ std::string addrToString(const sockaddr_storage* addr) {
 }
 
 bool parseServer(const char* server, sockaddr_storage* parsed) {
-    addrinfo hints = {.ai_family = AF_UNSPEC, .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV};
+    addrinfo hints = {
+            .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV,
+            .ai_family = AF_UNSPEC,
+    };
     addrinfo* res;
 
     int err = getaddrinfo(server, "853", &hints, &res);
@@ -56,9 +62,9 @@ bool parseServer(const char* server, sockaddr_storage* parsed) {
 
 int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
                                  const std::vector<std::string>& servers, const std::string& name,
-                                 const std::string& caCert) {
+                                 const std::string& caCert, int32_t connectTimeoutMs) {
     LOG(DEBUG) << "PrivateDnsConfiguration::set(" << netId << ", 0x" << std::hex << mark << std::dec
-               << ", " << servers.size() << ", " << name << ")";
+               << ", " << servers.size() << ", " << name << ", " << connectTimeoutMs << "ms)";
 
     // Parse the list of servers that has been passed in
     std::set<DnsTlsServer> tlsServers;
@@ -70,6 +76,15 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
         DnsTlsServer server(parsed);
         server.name = name;
         server.certificate = caCert;
+
+        // connectTimeoutMs = 0: use the default timeout value.
+        // connectTimeoutMs < 0: invalid timeout value.
+        if (connectTimeoutMs > 0) {
+            // Set a specific timeout value but limit it to be at least 1 second.
+            server.connectTimeout =
+                    (connectTimeoutMs < 1000) ? milliseconds(1000) : milliseconds(connectTimeoutMs);
+        }
+
         tlsServers.insert(server);
     }
 
@@ -81,6 +96,7 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
     } else {
         mPrivateDnsModes[netId] = PrivateDnsMode::OFF;
         mPrivateDnsTransports.erase(netId);
+        resolv_stats_set_servers_for_dot(netId, {});
         return 0;
     }
 
@@ -112,7 +128,8 @@ int PrivateDnsConfiguration::set(int32_t netId, uint32_t mark,
             validatePrivateDnsProvider(server, tracker, netId, mark);
         }
     }
-    return 0;
+
+    return resolv_stats_set_servers_for_dot(netId, servers);
 }
 
 PrivateDnsStatus PrivateDnsConfiguration::getStatus(unsigned netId) {
