@@ -61,10 +61,14 @@
 #include "DnsStats.h"
 #include "res_debug.h"
 #include "resolv_private.h"
+#include "util.h"
 
 using android::base::StringAppendF;
 using android::net::DnsQueryEvent;
 using android::net::DnsStats;
+using android::net::PROTO_DOT;
+using android::net::PROTO_TCP;
+using android::net::PROTO_UDP;
 using android::netdutils::DumpWriter;
 using android::netdutils::IPSockAddr;
 
@@ -936,7 +940,7 @@ struct resolv_cache_info {
     struct resolv_cache_info* next;
     int nscount;
     std::vector<std::string> nameservers;
-    struct addrinfo* nsaddrinfo[MAXNS];  // TODO: Use struct sockaddr_storage.
+    std::vector<IPSockAddr> nameserverSockAddrs;
     int revision_id;  // # times the nameservers have been replaced
     res_params params;
     struct res_stats nsstats[MAXNS];
@@ -1289,10 +1293,16 @@ int resolv_cache_add(unsigned netid, const void* query, int querylen, const void
     return 0;
 }
 
-bool resolv_gethostbyaddr_from_local_cache(unsigned netid, char domain_name[],
-                                           unsigned domain_name_size, char* ip_address) {
+bool resolv_gethostbyaddr_from_cache(unsigned netid, char domain_name[], size_t domain_name_size,
+                                     const char* ip_address, int af) {
     if (domain_name_size > NS_MAXDNAME) {
-        LOG(ERROR) << __func__ << ": invalid domain_name_size " << domain_name_size;
+        LOG(WARNING) << __func__ << ": invalid domain_name_size " << domain_name_size;
+        return false;
+    } else if (ip_address == nullptr || ip_address[0] == '\0') {
+        LOG(WARNING) << __func__ << ": invalid ip_address";
+        return false;
+    } else if (af != AF_INET && af != AF_INET6) {
+        LOG(WARNING) << __func__ << ": unsupported AF";
         return false;
     }
 
@@ -1301,14 +1311,11 @@ bool resolv_gethostbyaddr_from_local_cache(unsigned netid, char domain_name[],
 
     ns_rr rr;
     ns_msg handle;
-
-    int query_count;
     ns_rr rr_query;
 
-    // For ntop.
-    char* resolved_ip = nullptr;
-    char buf4[INET_ADDRSTRLEN];
-    char buf6[INET6_ADDRSTRLEN];
+    struct sockaddr_in sa;
+    struct sockaddr_in6 sa6;
+    char* addr_buf = nullptr;
 
     std::lock_guard guard(cache_mutex);
 
@@ -1336,29 +1343,29 @@ bool resolv_gethostbyaddr_from_local_cache(unsigned netid, char domain_name[],
                 continue;
             }
 
-            resolved_ip = nullptr;
-            if (ns_rr_type(rr) == ns_t_a) {
-                inet_ntop(AF_INET, ns_rr_rdata(rr), buf4, sizeof(buf4));
-                resolved_ip = buf4;
-            } else if (ns_rr_type(rr) == ns_t_aaaa) {
-                inet_ntop(AF_INET6, ns_rr_rdata(rr), buf6, sizeof(buf6));
-                resolved_ip = buf6;
+            if (ns_rr_type(rr) == ns_t_a && af == AF_INET) {
+                addr_buf = (char*)&(sa.sin_addr);
+            } else if (ns_rr_type(rr) == ns_t_aaaa && af == AF_INET6) {
+                addr_buf = (char*)&(sa6.sin6_addr);
             } else {
                 continue;
             }
 
-            if ((resolved_ip != nullptr) && (resolved_ip[0] != '\0')) {
-                if (strcmp(resolved_ip, ip_address) == 0) {
-                    query_count = ns_msg_count(handle, ns_s_qd);
-                    for (int i = 0; i < query_count; i++) {
-                        memset(&rr_query, 0, sizeof(rr_query));
-                        if (ns_parserr(&handle, ns_s_qd, i, &rr_query)) {
-                            continue;
-                        }
-                        strlcpy(domain_name, ns_rr_name(rr_query), domain_name_size);
-                        if (domain_name[0] != '\0') {
-                            return true;
-                        }
+            if (inet_pton(af, ip_address, addr_buf) != 1) {
+                LOG(WARNING) << __func__ << ": inet_pton() fail";
+                return false;
+            }
+
+            if (memcmp(ns_rr_rdata(rr), addr_buf, ns_rr_rdlen(rr)) == 0) {
+                int query_count = ns_msg_count(handle, ns_s_qd);
+                for (int i = 0; i < query_count; i++) {
+                    memset(&rr_query, 0, sizeof(rr_query));
+                    if (ns_parserr(&handle, ns_s_qd, i, &rr_query)) {
+                        continue;
+                    }
+                    strlcpy(domain_name, ns_rr_name(rr_query), domain_name_size);
+                    if (domain_name[0] != '\0') {
+                        return true;
                     }
                 }
             }
@@ -1563,6 +1570,21 @@ std::vector<std::string> filter_nameservers(const std::vector<std::string>& serv
     return res;
 }
 
+bool isValidServer(const std::string& server) {
+    const addrinfo hints = {
+            .ai_family = AF_UNSPEC,
+            .ai_socktype = SOCK_DGRAM,
+    };
+    addrinfo* result = nullptr;
+    if (int err = getaddrinfo_numeric(server.c_str(), "53", hints, &result); err != 0) {
+        LOG(WARNING) << __func__ << ": getaddrinfo_numeric(" << server
+                     << ") = " << gai_strerror(err);
+        return false;
+    }
+    freeaddrinfo(result);
+    return true;
+}
+
 }  // namespace
 
 int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
@@ -1574,24 +1596,11 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
 
     // Parse the addresses before actually locking or changing any state, in case there is an error.
     // As a side effect this also reduces the time the lock is kept.
-    // TODO: find a better way to replace addrinfo*, something like std::vector<SafeAddrinfo>
-    addrinfo* nsaddrinfo[MAXNS];
-    for (int i = 0; i < numservers; i++) {
-        // The addrinfo structures allocated here are freed in free_nameservers_locked().
-        const addrinfo hints = {
-                .ai_flags = AI_NUMERICHOST,
-                .ai_family = AF_UNSPEC,
-                .ai_socktype = SOCK_DGRAM,
-        };
-        const int rt = getaddrinfo_numeric(nameservers[i].c_str(), "53", hints, &nsaddrinfo[i]);
-        if (rt != 0) {
-            for (int j = 0; j < i; j++) {
-                freeaddrinfo(nsaddrinfo[j]);
-            }
-            LOG(INFO) << __func__ << ": getaddrinfo_numeric(" << nameservers[i]
-                      << ") = " << gai_strerror(rt);
-            return -EINVAL;
-        }
+    std::vector<IPSockAddr> ipSockAddrs;
+    ipSockAddrs.reserve(nameservers.size());
+    for (const auto& server : nameservers) {
+        if (!isValidServer(server)) return -EINVAL;
+        ipSockAddrs.push_back(IPSockAddr::toIPSockAddr(server, 53));
     }
 
     std::lock_guard guard(cache_mutex);
@@ -1607,10 +1616,10 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
         free_nameservers_locked(cache_info);
         cache_info->nameservers = std::move(nameservers);
         for (int i = 0; i < numservers; i++) {
-            cache_info->nsaddrinfo[i] = nsaddrinfo[i];
             LOG(INFO) << __func__ << ": netid = " << netid
                       << ", addr = " << cache_info->nameservers[i];
         }
+        cache_info->nameserverSockAddrs = std::move(ipSockAddrs);
         cache_info->nscount = numservers;
     } else {
         if (cache_info->params.max_samples != old_max_samples) {
@@ -1621,23 +1630,15 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
             // under which servers are considered usable.
             res_cache_clear_stats_locked(cache_info);
         }
-        for (int j = 0; j < numservers; j++) {
-            freeaddrinfo(nsaddrinfo[j]);
-        }
     }
 
     // Always update the search paths. Cache-flushing however is not necessary,
     // since the stored cache entries do contain the domain, not just the host name.
     cache_info->search_domains = filter_domains(domains);
 
-    std::vector<IPSockAddr> serverSockAddrs;
-    serverSockAddrs.reserve(cache_info->nameservers.size());
-    for (const auto& server : cache_info->nameservers) {
-        serverSockAddrs.push_back(IPSockAddr::toIPSockAddr(server, 53));
-    }
-
-    if (!cache_info->dnsStats->setServers(serverSockAddrs, android::net::PROTO_TCP) ||
-        !cache_info->dnsStats->setServers(serverSockAddrs, android::net::PROTO_UDP)) {
+    // Setup stats for cleartext dns servers.
+    if (!cache_info->dnsStats->setServers(cache_info->nameserverSockAddrs, PROTO_TCP) ||
+        !cache_info->dnsStats->setServers(cache_info->nameserverSockAddrs, PROTO_UDP)) {
         LOG(WARNING) << __func__ << ": netid = " << netid << ", failed to set dns stats";
         return -EINVAL;
     }
@@ -1659,44 +1660,38 @@ static bool resolv_is_nameservers_equal(const std::vector<std::string>& oldServe
 }
 
 static void free_nameservers_locked(resolv_cache_info* cache_info) {
-    int i;
-    for (i = 0; i < cache_info->nscount; i++) {
-        cache_info->nameservers.clear();
-        if (cache_info->nsaddrinfo[i] != nullptr) {
-            freeaddrinfo(cache_info->nsaddrinfo[i]);
-            cache_info->nsaddrinfo[i] = nullptr;
-        }
-    }
     cache_info->nscount = 0;
+    cache_info->nameservers.clear();
+    cache_info->nameserverSockAddrs.clear();
     res_cache_clear_stats_locked(cache_info);
 }
 
-void _resolv_populate_res_for_net(res_state statp) {
-    if (statp == NULL) {
+void resolv_populate_res_for_net(ResState* statp) {
+    if (statp == nullptr) {
         return;
     }
     LOG(INFO) << __func__ << ": netid=" << statp->netid;
 
     std::lock_guard guard(cache_mutex);
     resolv_cache_info* info = find_cache_info_locked(statp->netid);
-    if (info != NULL) {
-        int nserv;
-        struct addrinfo* ai;
-        for (nserv = 0; nserv < MAXNS; nserv++) {
-            ai = info->nsaddrinfo[nserv];
-            if (ai == NULL) {
-                break;
-            }
+    if (info == nullptr) return;
 
-            if ((size_t)ai->ai_addrlen <= sizeof(statp->nsaddrs[0])) {
-                memcpy(&statp->nsaddrs[nserv], ai->ai_addr, ai->ai_addrlen);
-            } else {
-                LOG(INFO) << __func__ << ": found too long addrlen";
-            }
+    // TODO: Convert nsaddrs[] to c++ container and remove the size-checking.
+    const int serverNum = std::min(MAXNS, static_cast<int>(info->nameserverSockAddrs.size()));
+
+    for (int nserv = 0; nserv < serverNum; nserv++) {
+        sockaddr_storage ss = info->nameserverSockAddrs.at(nserv);
+
+        if (auto sockaddr_len = sockaddrSize(ss); sockaddr_len != 0) {
+            memcpy(&statp->nsaddrs[nserv], &ss, sockaddr_len);
+        } else {
+            LOG(WARNING) << __func__ << ": can't get sa_len from "
+                         << info->nameserverSockAddrs.at(nserv);
         }
-        statp->nscount = nserv;
-        statp->search_domains = info->search_domains;
     }
+
+    statp->nscount = serverNum;
+    statp->search_domains = info->search_domains;
 }
 
 /* Resolver reachability statistics. */
@@ -1745,31 +1740,18 @@ int android_net_res_stats_get_info_for_net(unsigned netid, int* nscount,
             return -1;
         }
         int i;
-        for (i = 0; i < info->nscount; i++) {
-            // Verify that the following assumptions are held, failure indicates corruption:
-            //  - getaddrinfo() may never return a sockaddr > sockaddr_storage
-            //  - all addresses are valid
-            //  - there is only one address per addrinfo thanks to numeric resolution
-            int addrlen = info->nsaddrinfo[i]->ai_addrlen;
-            if (addrlen < (int) sizeof(struct sockaddr) || addrlen > (int) sizeof(servers[0])) {
-                LOG(INFO) << __func__ << ": nsaddrinfo[" << i << "].ai_addrlen == " << addrlen;
-                errno = EMSGSIZE;
-                return -1;
-            }
-            if (info->nsaddrinfo[i]->ai_addr == NULL) {
-                LOG(INFO) << __func__ << ": nsaddrinfo[" << i << "].ai_addr == NULL";
-                errno = ENOENT;
-                return -1;
-            }
-            if (info->nsaddrinfo[i]->ai_next != NULL) {
-                LOG(INFO) << __func__ << ": nsaddrinfo[" << i << "].ai_next != NULL";
-                errno = ENOTUNIQ;
-                return -1;
-            }
-        }
         *nscount = info->nscount;
+
+        // It shouldn't happen, but just in case of buffer overflow.
+        if (info->nscount != static_cast<int>(info->nameserverSockAddrs.size())) {
+            LOG(INFO) << __func__ << ": nscount " << info->nscount
+                      << " != " << info->nameserverSockAddrs.size();
+            errno = EFAULT;
+            return -1;
+        }
+
         for (i = 0; i < info->nscount; i++) {
-            memcpy(&servers[i], info->nsaddrinfo[i]->ai_addr, info->nsaddrinfo[i]->ai_addrlen);
+            servers[i] = info->nameserverSockAddrs.at(i);
             stats[i] = info->nsstats[i];
         }
 
