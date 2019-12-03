@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef _DNS_DNSTLSSERVER_H
-#define _DNS_DNSTLSSERVER_H
+#pragma once
 
 #include <chrono>
 #include <set>
@@ -24,7 +23,7 @@
 
 #include <netinet/in.h>
 
-#include <netd_resolv/params.h>
+#include <params.h>
 
 namespace android {
 namespace net {
@@ -62,7 +61,9 @@ struct DnsTlsServer {
     // The time to wait for the attempt on connecting to the server.
     // Set the default value 127 seconds to be consistent with TCP connect timeout.
     // (presume net.ipv4.tcp_syn_retries = 6)
-    std::chrono::milliseconds connectTimeout = std::chrono::milliseconds(127 * 1000);
+    static constexpr std::chrono::milliseconds kDotConnectTimeoutMs =
+            std::chrono::milliseconds(127 * 1000);
+    std::chrono::milliseconds connectTimeout = kDotConnectTimeoutMs;
 
     // Exact comparison of DnsTlsServer objects
     bool operator<(const DnsTlsServer& other) const;
@@ -78,5 +79,3 @@ struct AddressComparator {
 
 }  // namespace net
 }  // namespace android
-
-#endif  // _DNS_DNSTLSSERVER_H

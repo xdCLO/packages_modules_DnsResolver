@@ -26,8 +26,8 @@
 #include <gtest/gtest.h>
 
 #include "ResolverStats.h"
-#include "dns_responder/dns_responder_client.h"
-#include "netd_resolv/params.h"  // MAX_NS
+#include "dns_responder/dns_responder_client_ndk.h"
+#include "params.h"  // MAX_NS
 #include "resolv_test_utils.h"
 
 using android::base::StringPrintf;
@@ -87,9 +87,9 @@ class ResolverStressTest : public ::testing::Test {
         res_params res_params;
         std::vector<ResolverStats> res_stats;
         int wait_for_pending_req_timeout_count;
-        ASSERT_TRUE(GetResolverInfo(mDnsClient.resolvService(), TEST_NETID, &res_servers,
-                                    &res_domains, &res_tls_servers, &res_params, &res_stats,
-                                    &wait_for_pending_req_timeout_count));
+        ASSERT_TRUE(DnsResponderClient::GetResolverInfo(
+                mDnsClient.resolvService(), TEST_NETID, &res_servers, &res_domains,
+                &res_tls_servers, &res_params, &res_stats, &wait_for_pending_req_timeout_count));
         EXPECT_EQ(0, wait_for_pending_req_timeout_count);
     }
 
