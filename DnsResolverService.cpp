@@ -166,6 +166,13 @@ binder_status_t DnsResolverService::dump(int fd, const char**, uint32_t) {
         const ResolverParamsParcel& resolverParams) {
     // Locking happens in PrivateDnsConfiguration and res_* functions.
     ENFORCE_INTERNAL_PERMISSIONS();
+
+    uid_t uid = AIBinder_getCallingUid();
+    if (resolverParams.caCertificate.size() != 0 && uid == AID_SYSTEM) {
+        auto err = StringPrintf("UID %d is not authorized to set a non-empty CA certificate", uid);
+        return ::ndk::ScopedAStatus(AStatus_fromExceptionCodeWithMessage(EX_SECURITY, err.c_str()));
+    }
+
     // TODO: Remove this log after AIDL gen_log supporting more types, b/129732660
     auto entry =
             gDnsResolverLog.newEntry()
@@ -245,6 +252,15 @@ binder_status_t DnsResolverService::dump(int fd, const char**, uint32_t) {
     ENFORCE_NETWORK_STACK_PERMISSIONS();
 
     int res = gDnsResolv->resolverCtrl.createNetworkCache(netId);
+
+    return statusFromErrcode(res);
+}
+
+::ndk::ScopedAStatus DnsResolverService::flushNetworkCache(int netId) {
+    // Locking happens in res_cache.cpp functions.
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+
+    int res = gDnsResolv->resolverCtrl.flushNetworkCache(netId);
 
     return statusFromErrcode(res);
 }

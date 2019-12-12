@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@
 
 #define LOG_TAG "dns_responder_client"
 
-#include "dns_responder_client.h"
+#include "dns_responder_client_ndk.h"
 
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 
+#include <android/binder_manager.h>
 #include "NetdClient.h"
-#include "binder/IServiceManager.h"
 
 // TODO: make this dynamic and stop depending on implementation details.
 #define TEST_OEM_NETWORK "oem29"
@@ -31,9 +31,11 @@
 // TODO: move this somewhere shared.
 static const char* ANDROID_DNS_MODE = "ANDROID_DNS_MODE";
 
+using aidl::android::net::IDnsResolver;
+using aidl::android::net::INetd;
+using aidl::android::net::ResolverParamsParcel;
 using android::base::StringPrintf;
-using android::net::INetd;
-using android::net::ResolverParamsParcel;
+using android::net::ResolverStats;
 
 void DnsResponderClient::SetupMappings(unsigned numHosts, const std::vector<std::string>& domains,
                                        std::vector<Mapping>* mappings) {
@@ -52,13 +54,10 @@ void DnsResponderClient::SetupMappings(unsigned numHosts, const std::vector<std:
 
 // TODO: Use SetResolverConfiguration() with ResolverParamsParcel struct directly.
 // DEPRECATED: Use SetResolverConfiguration() in new code
-static ResolverParamsParcel makeResolverParamsParcel(int netId, const std::vector<int>& params,
-                                                     const std::vector<std::string>& servers,
-                                                     const std::vector<std::string>& domains,
-                                                     const std::string& tlsHostname,
-                                                     const std::vector<std::string>& tlsServers,
-                                                     const std::string& caCert) {
-    using android::net::IDnsResolver;
+ResolverParamsParcel DnsResponderClient::makeResolverParamsParcel(
+        int netId, const std::vector<int>& params, const std::vector<std::string>& servers,
+        const std::vector<std::string>& domains, const std::string& tlsHostname,
+        const std::vector<std::string>& tlsServers, const std::string& caCert) {
     ResolverParamsParcel paramsParcel;
 
     paramsParcel.netId = netId;
@@ -83,7 +82,58 @@ static ResolverParamsParcel makeResolverParamsParcel(int netId, const std::vecto
     paramsParcel.tlsFingerprints = {};
     paramsParcel.caCertificate = caCert;
 
+    // Note, do not remove this otherwise the ResolverTest#ConnectTlsServerTimeout won't pass in M4
+    // module.
+    // TODO: remove after 2020-01 rolls out.
+    paramsParcel.tlsConnectTimeoutMs = 1000;
+
     return paramsParcel;
+}
+
+bool DnsResponderClient::GetResolverInfo(aidl::android::net::IDnsResolver* dnsResolverService,
+                                         unsigned netId, std::vector<std::string>* servers,
+                                         std::vector<std::string>* domains,
+                                         std::vector<std::string>* tlsServers, res_params* params,
+                                         std::vector<ResolverStats>* stats,
+                                         int* waitForPendingReqTimeoutCount) {
+    using aidl::android::net::IDnsResolver;
+    std::vector<int32_t> params32;
+    std::vector<int32_t> stats32;
+    std::vector<int32_t> waitForPendingReqTimeoutCount32{0};
+    auto rv = dnsResolverService->getResolverInfo(netId, servers, domains, tlsServers, &params32,
+                                                  &stats32, &waitForPendingReqTimeoutCount32);
+
+    if (!rv.isOk() || params32.size() != static_cast<size_t>(IDnsResolver::RESOLVER_PARAMS_COUNT)) {
+        return false;
+    }
+    *params = res_params{
+            .sample_validity =
+                    static_cast<uint16_t>(params32[IDnsResolver::RESOLVER_PARAMS_SAMPLE_VALIDITY]),
+            .success_threshold =
+                    static_cast<uint8_t>(params32[IDnsResolver::RESOLVER_PARAMS_SUCCESS_THRESHOLD]),
+            .min_samples =
+                    static_cast<uint8_t>(params32[IDnsResolver::RESOLVER_PARAMS_MIN_SAMPLES]),
+            .max_samples =
+                    static_cast<uint8_t>(params32[IDnsResolver::RESOLVER_PARAMS_MAX_SAMPLES]),
+            .base_timeout_msec = params32[IDnsResolver::RESOLVER_PARAMS_BASE_TIMEOUT_MSEC],
+            .retry_count = params32[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT],
+    };
+    *waitForPendingReqTimeoutCount = waitForPendingReqTimeoutCount32[0];
+    return ResolverStats::decodeAll(stats32, stats);
+}
+
+bool DnsResponderClient::isRemoteVersionSupported(
+        aidl::android::net::IDnsResolver* dnsResolverService, int requiredVersion) {
+    int remoteVersion = 0;
+    if (!dnsResolverService->getInterfaceVersion(&remoteVersion).isOk()) {
+        LOG(FATAL) << "Can't get 'dnsresolver' remote version";
+    }
+    if (remoteVersion < requiredVersion) {
+        LOG(WARNING) << StringPrintf("Remote version: %d < Required version: %d", remoteVersion,
+                                     requiredVersion);
+        return false;
+    }
+    return true;
 }
 
 bool DnsResponderClient::SetResolversForNetwork(const std::vector<std::string>& servers,
@@ -103,13 +153,13 @@ bool DnsResponderClient::SetResolversWithTls(const std::vector<std::string>& ser
     const auto& resolverParams = makeResolverParamsParcel(TEST_NETID, params, servers, domains,
                                                           name, tlsServers, kCaCert);
     const auto rv = mDnsResolvSrv->setResolverConfiguration(resolverParams);
-    if (!rv.isOk()) LOG(ERROR) << "SetResolversWithTls() -> " << rv.toString8();
+    if (!rv.isOk()) LOG(ERROR) << "SetResolversWithTls() -> " << rv.getMessage();
     return rv.isOk();
 }
 
 bool DnsResponderClient::SetResolversFromParcel(const ResolverParamsParcel& resolverParams) {
     const auto rv = mDnsResolvSrv->setResolverConfiguration(resolverParams);
-    if (!rv.isOk()) LOG(ERROR) << "SetResolversFromParcel() -> " << rv.toString8();
+    if (!rv.isOk()) LOG(ERROR) << "SetResolversFromParcel() -> " << rv.getMessage();
     return rv.isOk();
 }
 
@@ -143,14 +193,12 @@ int DnsResponderClient::SetupOemNetwork() {
     mDnsResolvSrv->destroyNetworkCache(TEST_NETID);
     auto ret = mNetdSrv->networkCreatePhysical(TEST_NETID, INetd::PERMISSION_NONE);
     if (!ret.isOk()) {
-        fprintf(stderr, "Creating physical network %d failed, %s\n", TEST_NETID,
-                ret.toString8().string());
+        fprintf(stderr, "Creating physical network %d failed, %s\n", TEST_NETID, ret.getMessage());
         return -1;
     }
     ret = mDnsResolvSrv->createNetworkCache(TEST_NETID);
     if (!ret.isOk()) {
-        fprintf(stderr, "Creating network cache %d failed, %s\n", TEST_NETID,
-                ret.toString8().string());
+        fprintf(stderr, "Creating network cache %d failed, %s\n", TEST_NETID, ret.getMessage());
         return -1;
     }
     setNetworkForProcess(TEST_NETID);
@@ -169,15 +217,18 @@ void DnsResponderClient::TearDownOemNetwork(int oemNetId) {
 
 void DnsResponderClient::SetUp() {
     // binder setup
-    auto binder = android::defaultServiceManager()->getService(android::String16("netd"));
-    mNetdSrv = android::interface_cast<android::net::INetd>(binder);
-    if (mNetdSrv == nullptr) {
+    ndk::SpAIBinder netdBinder = ndk::SpAIBinder(AServiceManager_getService("netd"));
+    mNetdSrv = INetd::fromBinder(netdBinder);
+    if (mNetdSrv.get() == nullptr) {
         LOG(FATAL) << "Can't connect to service 'netd'. Missing root privileges? uid=" << getuid();
     }
 
-    auto resolvBinder =
-            android::defaultServiceManager()->getService(android::String16("dnsresolver"));
-    mDnsResolvSrv = android::interface_cast<android::net::IDnsResolver>(resolvBinder);
+    ndk::SpAIBinder resolvBinder = ndk::SpAIBinder(AServiceManager_getService("dnsresolver"));
+    mDnsResolvSrv = IDnsResolver::fromBinder(resolvBinder);
+    if (mDnsResolvSrv.get() == nullptr) {
+        LOG(FATAL) << "Can't connect to service 'dnsresolver'. Missing root privileges? uid="
+                   << getuid();
+    }
 
     // Ensure resolutions go via proxy.
     setenv(ANDROID_DNS_MODE, "", 1);
