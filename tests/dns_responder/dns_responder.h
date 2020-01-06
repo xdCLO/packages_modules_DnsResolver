@@ -34,6 +34,10 @@
 // Default TTL of the DNS answer record.
 constexpr unsigned kAnswerRecordTtlSec = 5;
 
+// The maximum UDP response size in bytes the DNS responder allows to send. It is used in non-EDNS
+// case. See RFC 1035 section 4.2.1.
+constexpr unsigned kMaximumUdpSize = 512;
+
 namespace test {
 
 struct DNSName {
@@ -123,7 +127,7 @@ inline const ns_rcode kDefaultErrorCode = ns_rcode::ns_r_servfail;
  */
 class DNSResponder {
   public:
-    enum class Edns : uint8_t {
+    enum class Edns {
         ON,
         FORMERR_ON_EDNS,  // DNS server not supporting EDNS will reply FORMERR.
         FORMERR_UNCOND,   // DNS server reply FORMERR unconditionally
@@ -133,10 +137,16 @@ class DNSResponder {
     // See also addMapping{, DnsHeader, BinaryPacket}, removeMapping{, DnsHeader, BinaryPacket},
     // makeResponse{, FromDnsHeader, FromBinaryPacket}.
     // TODO: Perhaps break class DNSResponder for each mapping.
-    enum class MappingType : uint8_t {
+    enum class MappingType {
         ADDRESS_OR_HOSTNAME,  // Use the mapping from (name, type) to (address or hostname)
         DNS_HEADER,           // Use the mapping from (name, type) to (DNSHeader)
         BINARY_PACKET,        // Use the mapping from (query packet) to (response packet)
+    };
+
+    struct QueryInfo {
+        std::string name;
+        ns_type type;
+        int protocol;  // Either IPPROTO_TCP or IPPROTO_UDP
     };
 
     DNSResponder(std::string listen_address = kDefaultListenAddr,
@@ -169,7 +179,7 @@ class DNSResponder {
     bool stopServer();
     const std::string& listen_address() const { return listen_address_; }
     const std::string& listen_service() const { return listen_service_; }
-    std::vector<std::pair<std::string, ns_type>> queries() const;
+    std::vector<QueryInfo> queries() const;
     std::string dumpQueries() const;
     void clearQueries();
     std::condition_variable& getCv() { return cv; }
@@ -218,10 +228,13 @@ class DNSResponder {
 
     void requestHandler();
 
+    // Check if any OPT Pseudo RR in the additional section.
+    bool hasOptPseudoRR(DNSHeader* header) const;
+
     // Parses and generates a response message for incoming DNS requests.
     // Returns false to ignore the request, which might be due to either parsing error
     // or unresponsiveness.
-    bool handleDNSRequest(const char* buffer, ssize_t buffer_len, char* response,
+    bool handleDNSRequest(const char* buffer, ssize_t buffer_len, int protocol, char* response,
                           size_t* response_len) const;
 
     bool addAnswerRecords(const DNSQuestion& question, std::vector<DNSRecord>* answers) const;
@@ -229,14 +242,20 @@ class DNSResponder {
     bool generateErrorResponse(DNSHeader* header, ns_rcode rcode, char* response,
                                size_t* response_len) const;
 
-    // TODO: Change writePacket, makeErrorResponse and
-    // makeResponse{, FromDnsHeader, FromBinaryPacket} to use C++ containers instead of the unsafe
-    // pointer + length buffer.
+    // TODO: Change writePacket, makeErrorResponse, makeTruncatedResponse and
+    // makeResponse{, FromAddressOrHostname, FromDnsHeader, FromBinaryPacket} to use C++ containers
+    // instead of the unsafe pointer + length buffer.
     bool writePacket(const DNSHeader* header, char* response, size_t* response_len) const;
+    // Build an error response with a given rcode.
     bool makeErrorResponse(DNSHeader* header, ns_rcode rcode, char* response,
                            size_t* response_len) const;
-    // Build a response from mapping {ADDRESS_OR_HOSTNAME, DNS_HEADER, BINARY_PACKET}.
-    bool makeResponse(DNSHeader* header, char* response, size_t* response_len) const;
+    // Build a truncated response.
+    bool makeTruncatedResponse(DNSHeader* header, char* response, size_t* response_len) const;
+    // Build a response.
+    bool makeResponse(DNSHeader* header, int protocol, char* response, size_t* response_len) const;
+    // Helper for building a response from mapping {ADDRESS_OR_HOSTNAME, DNS_HEADER, BINARY_PACKET}.
+    bool makeResponseFromAddressOrHostname(DNSHeader* header, char* response,
+                                           size_t* response_len) const;
     bool makeResponseFromDnsHeader(DNSHeader* header, char* response, size_t* response_len) const;
     bool makeResponseFromBinaryPacket(DNSHeader* header, char* response,
                                       size_t* response_len) const;
@@ -246,7 +265,7 @@ class DNSResponder {
 
     // Read the query sent from the client and send the answer back to the client. It
     // makes sure the I/O communicated with the client is correct.
-    void handleQuery();
+    void handleQuery(int protocol);
 
     // Trigger the handler thread to terminate.
     bool sendToEventFd();
@@ -254,7 +273,10 @@ class DNSResponder {
     // Used in the handler thread for the termination signal.
     void handleEventFd();
 
-    // Address and service to listen on, currently limited to UDP.
+    // TODO: Move createListeningSocket to resolv_test_utils.h
+    android::base::unique_fd createListeningSocket(int socket_type);
+
+    // Address and service to listen on TCP and UDP.
     const std::string listen_address_;
     const std::string listen_service_;
     // Error code to return for requests for an unknown name.
@@ -287,10 +309,11 @@ class DNSResponder {
 
     mutable std::mutex mappings_mutex_;
     // Query names received so far and the corresponding mutex.
-    mutable std::vector<std::pair<std::string, ns_type>> queries_ GUARDED_BY(queries_mutex_);
+    mutable std::vector<QueryInfo> queries_ GUARDED_BY(queries_mutex_);
     mutable std::mutex queries_mutex_;
     // Socket on which the server is listening.
-    android::base::unique_fd socket_;
+    android::base::unique_fd udp_socket_;
+    android::base::unique_fd tcp_socket_;
     // File descriptor for epoll.
     android::base::unique_fd epoll_fd_;
     // Eventfd used to signal for the handler thread termination.

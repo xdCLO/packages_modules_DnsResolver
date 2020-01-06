@@ -38,7 +38,6 @@
 #include <netdutils/SocketOption.h>
 #include <netdutils/Stopwatch.h>
 #include <netinet/in.h>
-#include <openssl/base64.h>
 #include <poll.h> /* poll */
 #include <private/android_filesystem_config.h>
 #include <resolv.h>
@@ -1378,8 +1377,8 @@ TEST_F(ResolverTest, GetHostByName_Tls) {
     EXPECT_EQ("1.2.3.2", ToString(result));
     const auto queries = dns.queries();
     EXPECT_EQ(1U, queries.size());
-    EXPECT_EQ("tls2.example.com.", queries[0].first);
-    EXPECT_EQ(ns_t_a, queries[0].second);
+    EXPECT_EQ("tls2.example.com.", queries[0].name);
+    EXPECT_EQ(ns_t_a, queries[0].type);
 
     // Reset the resolvers without enabling TLS.  Queries should still be routed
     // to the UDP endpoint.
@@ -3720,6 +3719,42 @@ TEST_F(ResolverTest, FlushNetworkCache_concurrent) {
     EXPECT_EQ(kHelloExampleComAddrV4, ToString(result));
 }
 
+// TODO: Perhaps to have a boundary conditions test for TCP and UDP.
+TEST_F(ResolverTest, TcpQueryWithOversizePayload) {
+    test::DNSResponder dns;
+    StartDns(dns, {{kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4}});
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    int fd = dns_open_proxy();
+    ASSERT_TRUE(fd > 0);
+
+    // Sending DNS query over TCP once the packet sizes exceed 512 bytes.
+    // The raw data is combined with Question section and Additional section
+    // Question section : query "hello.example.com", type A, class IN
+    // Additional section : type OPT (41), Option PADDING, Option Length 546
+    // Padding option which allows DNS clients and servers to artificially
+    // increase the size of a DNS message by a variable number of bytes.
+    // See also RFC7830, section 3
+    const std::string query =
+            "+c0BAAABAAAAAAABBWhlbGxvB2V4YW1wbGUDY29tAAABAAEAACkgAAAAgAACJgAMAiIAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const std::string cmd =
+            "resnsend " + std::to_string(TEST_NETID) + " 0 " /* ResNsendFlags */ + query + '\0';
+    ssize_t rc = TEMP_FAILURE_RETRY(write(fd, cmd.c_str(), cmd.size()));
+    EXPECT_EQ(rc, static_cast<ssize_t>(cmd.size()));
+    expectAnswersValid(fd, AF_INET, kHelloExampleComAddrV4);
+    EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom));
+    EXPECT_EQ(0U, GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom));
+}
+
 // Parameterized tests.
 // TODO: Merge the existing tests as parameterized test if possible.
 // TODO: Perhaps move parameterized tests to an independent file.
@@ -3727,7 +3762,8 @@ enum class CallType { GETADDRINFO, GETHOSTBYNAME };
 class ResolverParameterizedTest : public ResolverTest,
                                   public testing::WithParamInterface<CallType> {
   protected:
-    void VerifyQueryHelloExampleComV4(const test::DNSResponder& dns, const CallType calltype) {
+    void VerifyQueryHelloExampleComV4(const test::DNSResponder& dns, const CallType calltype,
+                                      const bool verifyNumQueries = true) {
         if (calltype == CallType::GETADDRINFO) {
             const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
             ScopedAddrinfo result = safe_getaddrinfo("hello", nullptr, &hints);
@@ -3743,7 +3779,7 @@ class ResolverParameterizedTest : public ResolverTest,
         } else {
             FAIL() << "Unsupported call type: " << static_cast<uint32_t>(calltype);
         }
-        EXPECT_EQ(1U, GetNumQueries(dns, kHelloExampleCom));
+        if (verifyNumQueries) EXPECT_EQ(1U, GetNumQueries(dns, kHelloExampleCom));
     }
 };
 
@@ -3956,4 +3992,44 @@ TEST_P(ResolverParameterizedTest, MessageCompression) {
         // Expect no cache because the TTL of testing responses are 0.
         VerifyQueryHelloExampleComV4(dns, calltype);
     }
+}
+
+TEST_P(ResolverParameterizedTest, TruncatedResponse) {
+    const auto& calltype = GetParam();
+
+    const size_t kMaxmiumLabelSize = 63;  // see RFC 1035 section 2.3.4.
+    const std::string kDomainName = ".example.com.";
+    const std::string kCnameA = std::string(kMaxmiumLabelSize, 'a') + kDomainName;
+    const std::string kCnameB = std::string(kMaxmiumLabelSize, 'b') + kDomainName;
+    const std::string kCnameC = std::string(kMaxmiumLabelSize, 'c') + kDomainName;
+    const std::string kCnameD = std::string(kMaxmiumLabelSize, 'd') + kDomainName;
+
+    // Build a response message which exceeds 512 bytes by CNAME chain.
+    //
+    // Ignoring the other fields of the message, the response message has 8 CNAMEs in 5 answer RRs
+    // and each CNAME has 77 bytes as the follows. The response message at least has 616 bytes in
+    // answer section and has already exceeded 512 bytes totally.
+    //
+    // The CNAME is presented as:
+    //   0   1            64  65                          72  73          76  77
+    //   +---+--........--+---+---+---+---+---+---+---+---+---+---+---+---+---+
+    //   | 63| {x, .., x} | 7 | e | x | a | m | p | l | e | 3 | c | o | m | 0 |
+    //   +---+--........--+---+---+---+---+---+---+---+---+---+---+---+---+---+
+    //          ^-- x = {a, b, c, d}
+    //
+    const std::vector<DnsRecord> records = {
+            {kHelloExampleCom, ns_type::ns_t_cname, kCnameA},
+            {kCnameA, ns_type::ns_t_cname, kCnameB},
+            {kCnameB, ns_type::ns_t_cname, kCnameC},
+            {kCnameC, ns_type::ns_t_cname, kCnameD},
+            {kCnameD, ns_type::ns_t_a, kHelloExampleComAddrV4},
+    };
+    test::DNSResponder dns;
+    StartDns(dns, records);
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    // Expect UDP response is truncated. The resolver retries over TCP. See RFC 1035 section 4.2.1.
+    VerifyQueryHelloExampleComV4(dns, calltype, false);
+    EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom));
+    EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom));
 }

@@ -60,6 +60,7 @@ cc_library {
         "util.cpp",
         "Dns64Configuration.cpp",
         "DnsProxyListener.cpp",
+        "DnsQueryLog.cpp",
         "DnsResolver.cpp",
         "DnsResolverService.cpp",
         "DnsStats.cpp",
@@ -113,6 +114,10 @@ cc_library {
             ],
         },
     },
+    header_abi_checker: {
+        enabled: true,
+        symbol_file: "libnetd_resolv.map.txt",
+    },
 }
 
 cc_library_static {
@@ -160,7 +165,7 @@ cc_library_static {
 // TODO: Move this test to tests/
 cc_test {
     name: "resolv_unit_test",
-    test_suites: ["device-tests"],
+    test_suites: ["device-tests", "mts"],
     require_root: true,
     //TODO:  drop root privileges and make it be an real unit test.
     defaults: ["netd_defaults"],
@@ -170,6 +175,7 @@ cc_test {
         "resolv_tls_unit_test.cpp",
         "resolv_unit_test.cpp",
         "DnsStatsTest.cpp",
+        "DnsQueryLogTest.cpp",
     ],
     shared_libs: [
         "libbase",
@@ -196,4 +202,13 @@ cc_test {
         "server_configurable_flags",
         "stats_proto",
     ],
+    compile_multilib: "both",
+    multilib: {
+        lib32: {
+            suffix: "32",
+        },
+        lib64: {
+            suffix: "64",
+        },
+    },
 }
