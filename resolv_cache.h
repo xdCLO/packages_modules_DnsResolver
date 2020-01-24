@@ -31,6 +31,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <aidl/android/net/IDnsResolver.h>
+#include <aidl/android/net/ResolverExperimentalOptionsParcel.h>
+
 #include <netdutils/DumpWriter.h>
 #include <netdutils/InternetAddresses.h>
 #include <stats.pb.h>
@@ -42,6 +45,9 @@
 // The name servers are retrieved from the cache which is associated
 // with the network to which ResState is associated.
 struct ResState;
+
+typedef std::multimap<std::string /* hostname */, std::string /* IPv4/IPv6 address */> HostMapping;
+
 void resolv_populate_res_for_net(ResState* statp);
 
 std::vector<unsigned> resolv_list_caches();
@@ -68,9 +74,16 @@ int resolv_cache_add(unsigned netid, const void* query, int querylen, const void
 /* Notify the cache a request failed */
 void _resolv_cache_query_failed(unsigned netid, const void* query, int querylen, uint32_t flags);
 
+// Get a customized table for a given network.
+std::vector<std::string> getCustomizedTableByName(const size_t netid, const char* hostname);
+
 // Sets name servers for a given network.
-int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
-                           const std::vector<std::string>& domains, const res_params& params);
+// TODO: Pass all of ResolverParamsParcel and remove the res_params argument.
+int resolv_set_nameservers(
+        unsigned netid, const std::vector<std::string>& servers,
+        const std::vector<std::string>& domains, const res_params& params,
+        const aidl::android::net::ResolverExperimentalOptionsParcel& experimentalOptions = {
+                {} /* hosts */, aidl::android::net::IDnsResolver::TC_MODE_DEFAULT});
 
 // Creates the cache associated with the given network.
 int resolv_create_cache_for_net(unsigned netid);
@@ -98,3 +111,7 @@ bool resolv_stats_add(unsigned netid, const android::netdutils::IPSockAddr& serv
                       const android::net::DnsQueryEvent* record);
 
 void resolv_stats_dump(android::netdutils::DumpWriter& dw, unsigned netid);
+
+void resolv_oem_options_dump(android::netdutils::DumpWriter& dw, unsigned netid);
+
+const char* tc_mode_to_str(const int mode);

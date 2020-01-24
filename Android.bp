@@ -3,11 +3,8 @@ cc_library_headers {
     export_include_dirs: ["include"],
 }
 
-//For the test to use
-//TODO: 1. Need to Refactor ResolverStats related code(ex: ResolverController::getDnsInfo).
-//         Then removing this library header file.
-//      2. Change the imports path in netd/TEST_MAPPING after migrating from
-//         system/netd/resolv to packages/modules/resolv.
+// Used only by dns_responder_client_ndk.cpp for ResolverStats.h
+// TODO: refactor stats to use a Parcel and eliminate this dependency
 cc_library_headers {
     name: "libnetd_resolv_internal_headers",
     export_include_dirs: ["."],
@@ -18,6 +15,8 @@ aidl_interface {
     local_include_dir: "binder",
     srcs: [
         "binder/android/net/IDnsResolver.aidl",
+        "binder/android/net/ResolverHostsParcel.aidl",
+        "binder/android/net/ResolverExperimentalOptionsParcel.aidl",
         "binder/android/net/ResolverParamsParcel.aidl",
     ],
     imports: [
@@ -85,7 +84,7 @@ cc_library {
         "libnetdutils",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
-        "libstatssocket",
+        "libstatspush_compat",
         "libsysutils",
         "libutils", // Used by libstatslog_resolv
         "netd_event_listener_interface-ndk_platform",
@@ -144,7 +143,7 @@ genrule {
 genrule {
     name: "statslog_resolv.cpp",
     tools: ["stats-log-api-gen"],
-    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv --namespace android,net,stats --importHeader statslog_resolv.h",
+    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv --namespace android,net,stats --importHeader statslog_resolv.h --supportQ",
     out: [
         "statslog_resolv.cpp",
     ],
@@ -158,6 +157,8 @@ cc_library_static {
     export_generated_headers: ["statslog_resolv.h"],
     static_libs: [
         "libcutils",
+        "libgtest_prod", // Used by libstatspush_compat
+        "libstatspush_compat",
         "libstatssocket",
     ],
 }
@@ -185,8 +186,7 @@ cc_test {
         "libbinder_ndk",
     ],
     static_libs: [
-        "dnsresolver_aidl_interface-cpp",
-        "dnsresolver_aidl_interface-ndk_platform",
+        "dnsresolver_aidl_interface-unstable-ndk_platform",
         "netd_event_listener_interface-ndk_platform",
         "libgmock",
         "liblog",
@@ -196,9 +196,11 @@ cc_test {
         "libnetdutils",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
+        "libstatspush_compat",
         "libstatssocket",
         "libsysutils",
         "libutils",
+        "resolv_stats_test_utils",
         "server_configurable_flags",
         "stats_proto",
     ],

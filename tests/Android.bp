@@ -6,7 +6,6 @@ cc_test_library {
     ],
     header_libs: [
         "libnetd_resolv_headers",
-        "libnetd_resolv_internal_headers",
     ],
     shared_libs: [
         "libbase",
@@ -41,7 +40,6 @@ cc_test {
     ],
     header_libs: [
         "libnetd_client_headers",
-        "libnetd_resolv_internal_headers",
     ],
     shared_libs: [
         "libbinder_ndk",
@@ -79,7 +77,6 @@ cc_test {
     ],
     header_libs: [
         "libnetd_resolv_headers",
-        "libnetd_resolv_internal_headers",
     ],
     shared_libs: [
         "libbase",
@@ -112,7 +109,6 @@ cc_test {
     ],
     header_libs: [
         "libnetd_resolv_headers",
-        "libnetd_resolv_internal_headers",
     ],
     // TODO: make static link libc++ work.
     //stl: "libc++_static",
@@ -147,4 +143,38 @@ cc_test {
             suffix: "64",
         },
     },
+}
+
+cc_test_library {
+    name: "resolv_stats_test_utils",
+    srcs: [
+        "resolv_stats_test_utils.cpp"
+    ],
+    defaults: ["netd_defaults"],
+    export_include_dirs: ["."],
+    static_libs: [
+        "libbase",
+        "libgmock",
+        "liblog",
+        "libnetdutils",
+        "libprotobuf-cpp-lite",
+        "stats_proto",
+    ],
+}
+
+cc_test {
+    name: "resolv_stats_test_utils_test",
+    srcs: [
+        "resolv_stats_test_utils_test.cpp",
+    ],
+    defaults: ["netd_defaults"],
+    test_suites: ["device-tests"],
+    static_libs: [
+        "libbase",
+        "libgmock",
+        "liblog",
+        "libprotobuf-cpp-lite",
+        "resolv_stats_test_utils",
+        "stats_proto",
+    ],
 }

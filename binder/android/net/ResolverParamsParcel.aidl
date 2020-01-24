@@ -16,6 +16,8 @@
 
 package android.net;
 
+import android.net.ResolverExperimentalOptionsParcel;
+
 /**
  * Configuration for a resolver parameters.
  *
@@ -97,4 +99,9 @@ parcelable ResolverParamsParcel {
      * by the experiement flag.
      */
     int tlsConnectTimeoutMs = 0;
+
+    /**
+    * Knobs for OEM to control alternative behavior.
+    */
+    ResolverExperimentalOptionsParcel experimentalOptions;
 }
