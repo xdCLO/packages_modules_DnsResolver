@@ -156,14 +156,13 @@ class ResolverTest : public ::testing::Test {
     static void TearDownTestCase() { AIBinder_DeathRecipient_delete(sResolvDeathRecipient); }
 
   protected:
-    struct DnsRecord {
-        std::string host_name;  // host name
-        ns_type type;           // record type
-        std::string addr;       // ipv4/v6 address
-    };
-
     void SetUp() { mDnsClient.SetUp(); }
-    void TearDown() { mDnsClient.TearDown(); }
+    void TearDown() {
+        // Ensure the dump works at the end of each test.
+        DumpResolverService();
+
+        mDnsClient.TearDown();
+    }
 
     void StartDns(test::DNSResponder& dns, const std::vector<DnsRecord>& records) {
         for (const auto& r : records) {
@@ -172,6 +171,14 @@ class ResolverTest : public ::testing::Test {
 
         ASSERT_TRUE(dns.startServer());
         dns.clearQueries();
+    }
+
+    void DumpResolverService() {
+        unique_fd fd(open("/dev/null", O_WRONLY));
+        EXPECT_EQ(mDnsClient.resolvService()->dump(fd, nullptr, 0), 0);
+
+        const char* querylogCmd[] = {"querylog"};  // Keep it sync with DnsQueryLog::DUMP_KEYWORD.
+        EXPECT_EQ(mDnsClient.resolvService()->dump(fd, querylogCmd, std::size(querylogCmd)), 0);
     }
 
     bool WaitForNat64Prefix(ExpectNat64PrefixStatus status,
@@ -563,7 +570,6 @@ TEST_F(ResolverTest, GetAddrInfo_InvalidSocketType) {
     const addrinfo hints = {
             .ai_family = AF_UNSPEC,
             .ai_socktype = SOCK_PACKET,
-            .ai_protocol = ANY,
     };
     addrinfo* result = nullptr;
     // This is a valid hint, but the query won't be sent because the socket type is
@@ -998,6 +1004,143 @@ TEST_F(ResolverTest, SkipBadServersDueToTimeout) {
     EXPECT_EQ(res_stats[1].timeouts, 0);
     EXPECT_EQ(dns1.queries().size(), 2U);
     EXPECT_EQ(dns2.queries().size(), 5U);
+}
+
+TEST_F(ResolverTest, GetAddrInfoFromCustTable_InvalidInput) {
+    constexpr char hostnameNoip[] = "noip.example.com.";
+    constexpr char hostnameInvalidip[] = "invalidip.example.com.";
+    const std::vector<aidl::android::net::ResolverHostsParcel> invalidCustHosts = {
+            {"", hostnameNoip},
+            {"wrong IP", hostnameInvalidip},
+    };
+    test::DNSResponder dns;
+    StartDns(dns, {});
+    auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
+    resolverParams.experimentalOptions.hosts = invalidCustHosts;
+    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    for (const auto& hostname : {hostnameNoip, hostnameInvalidip}) {
+        // The query won't get data from customized table because of invalid customized table
+        // and DNSResponder also has no records. hostnameNoip has never registered and
+        // hostnameInvalidip has registered but wrong IP.
+        const addrinfo hints = {.ai_family = AF_UNSPEC};
+        ScopedAddrinfo result = safe_getaddrinfo(hostname, nullptr, &hints);
+        ASSERT_TRUE(result == nullptr);
+        EXPECT_EQ(4U, GetNumQueries(dns, hostname));
+    }
+}
+
+TEST_F(ResolverTest, GetAddrInfoFromCustTable) {
+    constexpr char hostnameV4[] = "v4only.example.com.";
+    constexpr char hostnameV6[] = "v6only.example.com.";
+    constexpr char hostnameV4V6[] = "v4v6.example.com.";
+    constexpr char custAddrV4[] = "1.2.3.4";
+    constexpr char custAddrV6[] = "::1.2.3.4";
+    constexpr char dnsSvAddrV4[] = "1.2.3.5";
+    constexpr char dnsSvAddrV6[] = "::1.2.3.5";
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV4 = {
+            {custAddrV4, hostnameV4},
+    };
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV6 = {
+            {custAddrV6, hostnameV6},
+    };
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV4V6 = {
+            {custAddrV4, hostnameV4V6},
+            {custAddrV6, hostnameV4V6},
+    };
+    const std::vector<DnsRecord> dnsSvHostV4 = {
+            {hostnameV4, ns_type::ns_t_a, dnsSvAddrV4},
+    };
+    const std::vector<DnsRecord> dnsSvHostV6 = {
+            {hostnameV6, ns_type::ns_t_aaaa, dnsSvAddrV6},
+    };
+    const std::vector<DnsRecord> dnsSvHostV4V6 = {
+            {hostnameV4V6, ns_type::ns_t_a, dnsSvAddrV4},
+            {hostnameV4V6, ns_type::ns_t_aaaa, dnsSvAddrV6},
+    };
+    struct TestConfig {
+        const std::string name;
+        const std::vector<aidl::android::net::ResolverHostsParcel> customizedHosts;
+        const std::vector<DnsRecord> dnsserverHosts;
+        const std::vector<std::string> queryResult;
+        std::string asParameters() const {
+            return StringPrintf("name: %s, customizedHosts: %s, dnsserverHosts: %s", name.c_str(),
+                                customizedHosts.empty() ? "No" : "Yes",
+                                dnsserverHosts.empty() ? "No" : "Yes");
+        }
+    } testConfigs[]{
+            // clang-format off
+            {hostnameV4,    {},            {},             {}},
+            {hostnameV4,    {},            dnsSvHostV4,    {dnsSvAddrV4}},
+            {hostnameV4,    custHostV4,    {},             {custAddrV4}},
+            {hostnameV4,    custHostV4,    dnsSvHostV4,    {custAddrV4}},
+            {hostnameV6,    {},            {},             {}},
+            {hostnameV6,    {},            dnsSvHostV6,    {dnsSvAddrV6}},
+            {hostnameV6,    custHostV6,    {},             {custAddrV6}},
+            {hostnameV6,    custHostV6,    dnsSvHostV6,    {custAddrV6}},
+            {hostnameV4V6,  {},            {},             {}},
+            {hostnameV4V6,  {},            dnsSvHostV4V6,  {dnsSvAddrV4, dnsSvAddrV6}},
+            {hostnameV4V6,  custHostV4V6,  {},             {custAddrV4, custAddrV6}},
+            {hostnameV4V6,  custHostV4V6,  dnsSvHostV4V6,  {custAddrV4, custAddrV6}},
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(config.asParameters());
+
+        test::DNSResponder dns;
+        StartDns(dns, config.dnsserverHosts);
+
+        auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
+        resolverParams.experimentalOptions.hosts = config.customizedHosts;
+        ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+        const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
+        ScopedAddrinfo result = safe_getaddrinfo(config.name.c_str(), nullptr, &hints);
+        if (config.customizedHosts.empty() && config.dnsserverHosts.empty()) {
+            ASSERT_TRUE(result == nullptr);
+            EXPECT_EQ(2U, GetNumQueries(dns, config.name.c_str()));
+        } else {
+            ASSERT_TRUE(result != nullptr);
+            EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray(config.queryResult));
+            EXPECT_EQ(config.customizedHosts.empty() ? 2U : 0U,
+                      GetNumQueries(dns, config.name.c_str()));
+        }
+
+        EXPECT_TRUE(mDnsClient.resolvService()->flushNetworkCache(TEST_NETID).isOk());
+    }
+}
+
+TEST_F(ResolverTest, GetAddrInfoFromCustTable_Modify) {
+    constexpr char hostnameV4V6[] = "v4v6.example.com.";
+    constexpr char custAddrV4[] = "1.2.3.4";
+    constexpr char custAddrV6[] = "::1.2.3.4";
+    constexpr char dnsSvAddrV4[] = "1.2.3.5";
+    constexpr char dnsSvAddrV6[] = "::1.2.3.5";
+    const std::vector<DnsRecord> dnsSvHostV4V6 = {
+            {hostnameV4V6, ns_type::ns_t_a, dnsSvAddrV4},
+            {hostnameV4V6, ns_type::ns_t_aaaa, dnsSvAddrV6},
+    };
+    const std::vector<aidl::android::net::ResolverHostsParcel> custHostV4V6 = {
+            {custAddrV4, hostnameV4V6},
+            {custAddrV6, hostnameV4V6},
+    };
+    test::DNSResponder dns;
+    StartDns(dns, dnsSvHostV4V6);
+    auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
+
+    resolverParams.experimentalOptions.hosts = custHostV4V6;
+    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
+    ScopedAddrinfo result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
+    ASSERT_TRUE(result != nullptr);
+    EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({custAddrV4, custAddrV6}));
+    EXPECT_EQ(0U, GetNumQueries(dns, hostnameV4V6));
+
+    resolverParams.experimentalOptions.hosts = {};
+    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+    result = safe_getaddrinfo(hostnameV4V6, nullptr, &hints);
+    ASSERT_TRUE(result != nullptr);
+    EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({dnsSvAddrV4, dnsSvAddrV6}));
+    EXPECT_EQ(2U, GetNumQueries(dns, hostnameV4V6));
 }
 
 TEST_F(ResolverTest, EmptySetup) {
@@ -3755,6 +3898,62 @@ TEST_F(ResolverTest, TcpQueryWithOversizePayload) {
     EXPECT_EQ(0U, GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom));
 }
 
+TEST_F(ResolverTest, TruncatedRspMode) {
+    constexpr char listen_addr[] = "127.0.0.4";
+    constexpr char listen_addr2[] = "127.0.0.5";
+    constexpr char listen_srv[] = "53";
+
+    test::DNSResponder dns(listen_addr, listen_srv, static_cast<ns_rcode>(-1));
+    test::DNSResponder dns2(listen_addr2, listen_srv, static_cast<ns_rcode>(-1));
+    // dns supports UDP only, dns2 support UDP and TCP
+    dns.setResponseProbability(0.0, IPPROTO_TCP);
+    StartDns(dns, kLargeCnameChainRecords);
+    StartDns(dns2, kLargeCnameChainRecords);
+
+    const struct TestConfig {
+        const std::optional<int32_t> tcMode;
+        const bool ret;
+        const unsigned numQueries;
+        std::string asParameters() const {
+            return StringPrintf("tcMode: %d, ret: %s, numQueries: %u", tcMode.value_or(-1),
+                                ret ? "true" : "false", numQueries);
+        }
+    } testConfigs[]{
+            // clang-format off
+            {std::nullopt,                                      true,  0}, /* mode unset */
+            {aidl::android::net::IDnsResolver::TC_MODE_DEFAULT, true,  0}, /* default mode */
+            {aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP, true,  1}, /* alternative mode */
+            {-666,                                              false, 1}, /* invalid input */
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(config.asParameters());
+
+        ResolverParamsParcel parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+        parcel.servers = {listen_addr, listen_addr2};
+        if (config.tcMode) {
+            parcel.experimentalOptions.tcMode = config.tcMode.value();
+        }
+        ASSERT_EQ(mDnsClient.resolvService()->setResolverConfiguration(parcel).isOk(), config.ret);
+
+        const addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_DGRAM};
+        ScopedAddrinfo result = safe_getaddrinfo("hello", nullptr, &hints);
+        ASSERT_TRUE(result != nullptr);
+        EXPECT_EQ(ToString(result), kHelloExampleComAddrV4);
+        // TC_MODE_DEFAULT: resolver retries on TCP-only on each name server.
+        // TC_MODE_UDP_TCP: resolver retries on TCP on the same server, falls back to UDP from next.
+        ASSERT_EQ(GetNumQueriesForProtocol(dns, IPPROTO_UDP, kHelloExampleCom), 1U);
+        ASSERT_EQ(GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom), 1U);
+        ASSERT_EQ(GetNumQueriesForProtocol(dns2, IPPROTO_UDP, kHelloExampleCom), config.numQueries);
+        ASSERT_EQ(GetNumQueriesForProtocol(dns2, IPPROTO_TCP, kHelloExampleCom), 1U);
+
+        dns.clearQueries();
+        dns2.clearQueries();
+        ASSERT_TRUE(mDnsClient.resolvService()->flushNetworkCache(TEST_NETID).isOk());
+    }
+}
+
 // Parameterized tests.
 // TODO: Merge the existing tests as parameterized test if possible.
 // TODO: Perhaps move parameterized tests to an independent file.
@@ -3997,35 +4196,8 @@ TEST_P(ResolverParameterizedTest, MessageCompression) {
 TEST_P(ResolverParameterizedTest, TruncatedResponse) {
     const auto& calltype = GetParam();
 
-    const size_t kMaxmiumLabelSize = 63;  // see RFC 1035 section 2.3.4.
-    const std::string kDomainName = ".example.com.";
-    const std::string kCnameA = std::string(kMaxmiumLabelSize, 'a') + kDomainName;
-    const std::string kCnameB = std::string(kMaxmiumLabelSize, 'b') + kDomainName;
-    const std::string kCnameC = std::string(kMaxmiumLabelSize, 'c') + kDomainName;
-    const std::string kCnameD = std::string(kMaxmiumLabelSize, 'd') + kDomainName;
-
-    // Build a response message which exceeds 512 bytes by CNAME chain.
-    //
-    // Ignoring the other fields of the message, the response message has 8 CNAMEs in 5 answer RRs
-    // and each CNAME has 77 bytes as the follows. The response message at least has 616 bytes in
-    // answer section and has already exceeded 512 bytes totally.
-    //
-    // The CNAME is presented as:
-    //   0   1            64  65                          72  73          76  77
-    //   +---+--........--+---+---+---+---+---+---+---+---+---+---+---+---+---+
-    //   | 63| {x, .., x} | 7 | e | x | a | m | p | l | e | 3 | c | o | m | 0 |
-    //   +---+--........--+---+---+---+---+---+---+---+---+---+---+---+---+---+
-    //          ^-- x = {a, b, c, d}
-    //
-    const std::vector<DnsRecord> records = {
-            {kHelloExampleCom, ns_type::ns_t_cname, kCnameA},
-            {kCnameA, ns_type::ns_t_cname, kCnameB},
-            {kCnameB, ns_type::ns_t_cname, kCnameC},
-            {kCnameC, ns_type::ns_t_cname, kCnameD},
-            {kCnameD, ns_type::ns_t_a, kHelloExampleComAddrV4},
-    };
     test::DNSResponder dns;
-    StartDns(dns, records);
+    StartDns(dns, kLargeCnameChainRecords);
     ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
 
     // Expect UDP response is truncated. The resolver retries over TCP. See RFC 1035 section 4.2.1.
