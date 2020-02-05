@@ -59,6 +59,7 @@
 #include <server_configurable_flags/get_flags.h>
 
 #include "DnsStats.h"
+#include "res_comp.h"
 #include "res_debug.h"
 #include "resolv_private.h"
 #include "util.h"
@@ -435,6 +436,7 @@ static unsigned _dnsPacket_hashBytes(DnsPacket* packet, int numBytes, unsigned h
 
     while (numBytes > 0 && p < end) {
         hash = hash * FNV_MULT ^ *p++;
+        numBytes--;
     }
     packet->cursor = p;
     return hash;
