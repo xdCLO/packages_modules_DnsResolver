@@ -180,7 +180,6 @@ cc_test {
     name: "resolv_unit_test",
     test_suites: ["device-tests", "mts"],
     require_root: true,
-    test_config: "resolv_unit_test_config.xml",
     //TODO:  drop root privileges and make it be an real unit test.
     defaults: ["netd_defaults"],
     srcs: [
@@ -192,17 +191,17 @@ cc_test {
         "DnsQueryLogTest.cpp",
     ],
     shared_libs: [
-        "libbase",
         "libcrypto",
-        "libcutils",
-        "libssl",
         "libbinder_ndk",
+        "liblog",
+        "libssl",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-unstable-ndk_platform",
         "netd_event_listener_interface-ndk_platform",
+        "libcutils",
+        "libbase",
         "libgmock",
-        "liblog",
         "libnetd_resolv",
         "libnetd_test_dnsresponder",
         "libnetd_test_resolv_utils",
@@ -216,13 +215,5 @@ cc_test {
         "server_configurable_flags",
         "stats_proto",
     ],
-    compile_multilib: "both",
-    multilib: {
-        lib32: {
-            suffix: "32",
-        },
-        lib64: {
-            suffix: "64",
-        },
-    },
+    compile_multilib: "first",
 }
