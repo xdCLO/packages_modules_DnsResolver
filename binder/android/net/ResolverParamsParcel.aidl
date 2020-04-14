@@ -16,7 +16,7 @@
 
 package android.net;
 
-import android.net.ResolverExperimentalOptionsParcel;
+import android.net.ResolverOptionsParcel;
 
 /**
  * Configuration for a resolver parameters.
@@ -101,7 +101,15 @@ parcelable ResolverParamsParcel {
     int tlsConnectTimeoutMs = 0;
 
     /**
-    * Knobs for OEM to control alternative behavior.
-    */
-    ResolverExperimentalOptionsParcel experimentalOptions;
+     * Knobs for OEM to control alternative behavior.
+     */
+    ResolverOptionsParcel resolverOptions;
+
+    /**
+     * The transport types associated to a given network.
+     * The valid value is defined in one of the IDnsResolver.TRANSPORT_* constants.
+     * If there are multiple transport types but can't be identified to a
+     * reasonable network type by DnsResolver, it would be considered as unknown.
+     */
+    int[] transportTypes = {};
 }
