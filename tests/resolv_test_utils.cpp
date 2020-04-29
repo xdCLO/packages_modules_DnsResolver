@@ -19,6 +19,7 @@
 
 #include <arpa/inet.h>
 
+#include <android-base/chrono_utils.h>
 #include <netdutils/InternetAddresses.h>
 
 using android::netdutils::ScopedAddrinfo;
@@ -34,14 +35,12 @@ std::string ToString(const hostent* he) {
 
 std::string ToString(const addrinfo* ai) {
     if (!ai) return "<null>";
-    for (const auto* aip = ai; aip != nullptr; aip = aip->ai_next) {
-        char host[NI_MAXHOST];
-        int rv = getnameinfo(aip->ai_addr, aip->ai_addrlen, host, sizeof(host), nullptr, 0,
-                             NI_NUMERICHOST);
-        if (rv != 0) return gai_strerror(rv);
-        return host;
-    }
-    return "<invalid>";
+
+    char host[NI_MAXHOST];
+    int rv = getnameinfo(ai->ai_addr, ai->ai_addrlen, host, sizeof(host), nullptr, 0,
+                         NI_NUMERICHOST);
+    if (rv != 0) return gai_strerror(rv);
+    return host;
 }
 
 std::string ToString(const ScopedAddrinfo& ai) {
@@ -136,4 +135,14 @@ size_t GetNumQueriesForType(const test::DNSResponder& dns, ns_type type, const c
         }
     }
     return found;
+}
+
+bool PollForCondition(const std::function<bool()>& condition, std::chrono::milliseconds timeout) {
+    constexpr std::chrono::milliseconds retryIntervalMs{5};
+    android::base::Timer t;
+    while (t.duration() < timeout) {
+        if (condition()) return true;
+        std::this_thread::sleep_for(retryIntervalMs);
+    }
+    return false;
 }
