@@ -16,7 +16,7 @@ aidl_interface {
     srcs: [
         "binder/android/net/IDnsResolver.aidl",
         "binder/android/net/ResolverHostsParcel.aidl",
-        "binder/android/net/ResolverExperimentalOptionsParcel.aidl",
+        "binder/android/net/ResolverOptionsParcel.aidl",
         "binder/android/net/ResolverParamsParcel.aidl",
     ],
     imports: [
@@ -25,18 +25,23 @@ aidl_interface {
     backend: {
         java: {
             apex_available: [
+                "//apex_available:platform",
                 "com.android.bluetooth.updatable",
                 "com.android.wifi",
             ],
         },
         ndk: {
             gen_log: true,
+            apex_available: [
+                "com.android.resolv",
+            ],
         },
     },
     versions: [
         "1",
         "2",
         "3",
+        "4",
     ],
 }
 
@@ -106,6 +111,7 @@ cc_library {
         "DnsTlsServer.cpp",
         "DnsTlsSessionCache.cpp",
         "DnsTlsSocket.cpp",
+        "Experiments.cpp",
         "PrivateDnsConfiguration.cpp",
         "ResolverController.cpp",
         "ResolverEventReporter.cpp",
@@ -113,7 +119,7 @@ cc_library {
     // Link most things statically to minimize our dependence on system ABIs.
     stl: "libc++_static",
     static_libs: [
-        "dnsresolver_aidl_interface-unstable-ndk_platform",
+        "dnsresolver_aidl_interface-ndk_platform",
         "libbase",
         "libcutils",
         "libjsoncpp",
@@ -162,6 +168,7 @@ cc_library {
     sanitize: {
         cfi: true,
     },
+    apex_available: ["com.android.resolv"],
 }
 
 cc_library_static {
@@ -174,6 +181,7 @@ cc_library_static {
     srcs: [
         "stats.proto",
     ],
+    apex_available: ["com.android.resolv"],
 }
 
 genrule {
@@ -205,6 +213,7 @@ cc_library_static {
         "libgtest_prod", // Used by libstatspush_compat
         "libstatspush_compat",
     ],
+    apex_available: ["com.android.resolv"],
 }
 
 filegroup {
@@ -217,18 +226,26 @@ filegroup {
 // TODO: Move this test to tests/
 cc_test {
     name: "resolv_unit_test",
-    test_suites: ["device-tests", "mts"],
+    test_suites: [
+        "device-tests",
+        "mts",
+    ],
     require_root: true,
     // TODO: Drop root privileges and make it be an real unit test.
     // TODO: Remove resolv_test_mts_coverage_defaults after mts coverage switched to 64-bit device.
-    defaults: ["netd_defaults", "resolv_test_defaults", "resolv_test_mts_coverage_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+        "resolv_test_mts_coverage_defaults",
+    ],
     srcs: [
         "resolv_cache_unit_test.cpp",
         "resolv_callback_unit_test.cpp",
         "resolv_tls_unit_test.cpp",
         "resolv_unit_test.cpp",
-        "DnsStatsTest.cpp",
         "DnsQueryLogTest.cpp",
+        "DnsStatsTest.cpp",
+        "ExperimentsTest.cpp",
     ],
     shared_libs: [
         "libcrypto",

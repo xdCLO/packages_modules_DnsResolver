@@ -245,7 +245,7 @@ class TestBase : public ::testing::Test {
 
         // Verify DNS server query status.
         EXPECT_EQ(GetNumQueries(dns, name.c_str()), queries);
-        if (protocol == DnsProtocol::TLS) EXPECT_EQ(tls.queries(), static_cast<int>(queries));
+        if (protocol == DnsProtocol::TLS) EXPECT_TRUE(tls.waitForQueries(queries));
     }
 
     static constexpr res_params kParams = {
@@ -380,7 +380,7 @@ TEST_F(ResolvGetAddrInfo, BasicTlsQuery) {
     const std::vector<std::string> result_strs = ToStrings(result);
     EXPECT_THAT(result_strs, testing::UnorderedElementsAreArray(
                                      {kHelloExampleComAddrV4, kHelloExampleComAddrV6}));
-    EXPECT_EQ(tls.queries(), 3);
+    EXPECT_TRUE(tls.waitForQueries(3));
 }
 
 // Parameterized test class definition.
@@ -388,7 +388,7 @@ using GoldTestParamType = std::tuple<DnsProtocol, std::string /* filename */>;
 class ResolvGoldTest : public TestBase, public ::testing::WithParamInterface<GoldTestParamType> {
   public:
     // Generate readable string for test name from test parameters.
-    static std::string Name(::testing::TestParamInfo<GoldTestParamType> info) {
+    static std::string Name(const ::testing::TestParamInfo<GoldTestParamType>& info) {
         const auto& [protocol, file] = info.param;
         std::string name = StringPrintf(
                 "%s_%s", protocol == DnsProtocol::CLEARTEXT ? "CLEARTEXT" : "TLS", file.c_str());
