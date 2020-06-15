@@ -130,6 +130,7 @@ using android::net::IpVersion;
 using android::net::IV_IPV4;
 using android::net::IV_IPV6;
 using android::net::IV_UNKNOWN;
+using android::net::LinuxErrno;
 using android::net::NetworkDnsEventReported;
 using android::net::NS_T_INVALID;
 using android::net::NsRcode;
@@ -410,6 +411,15 @@ static DnsQueryEvent* addDnsQueryEvent(NetworkDnsEventReported* event) {
     return event->mutable_dns_query_events()->add_dns_query_event();
 }
 
+static bool isNetworkRestricted(int terrno) {
+    // It's possible that system was in some network restricted mode, which blocked
+    // the operation of sending packet and resulted in EPERM errno.
+    // It would be no reason to keep retrying on that case.
+    // TODO: Check the system status to know if network restricted mode is
+    // enabled.
+    return (terrno == EPERM);
+}
+
 int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int anssiz, int* rcode,
               uint32_t flags, std::chrono::milliseconds sleepTimeMs) {
     LOG(DEBUG) << __func__;
@@ -499,7 +509,8 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
     int retryTimes = (flags & ANDROID_RESOLV_NO_RETRY) ? 1 : params.retry_count;
     int useTcp = buflen > PACKETSZ;
     int gotsomewhere = 0;
-    int terrno = ETIMEDOUT;
+    // Use an impossible error code as default value
+    int terrno = ETIME;
 
     for (int attempt = 0; attempt < retryTimes; ++attempt) {
         for (size_t ns = 0; ns < statp->nsaddrs.size(); ++ns) {
@@ -521,6 +532,8 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
             Stopwatch queryStopwatch;
             int retry_count_for_event = 0;
             size_t actualNs = ns;
+            // Use an impossible error code as default value
+            terrno = ETIME;
             if (useTcp) {
                 // TCP; at most one attempt per server.
                 attempt = retryTimes;
@@ -533,14 +546,14 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
                     // TCP fallback retry and current server does not support TCP connectin
                     useTcp = false;
                 }
-                LOG(INFO) << __func__ << ": used send_vc " << resplen;
+                LOG(INFO) << __func__ << ": used send_vc " << resplen << " terrno: " << terrno;
             } else {
                 // UDP
                 resplen = send_dg(statp, &params, buf, buflen, ans, anssiz, &terrno, &actualNs,
                                   &useTcp, &gotsomewhere, &query_time, rcode, &delay);
                 fallbackTCP = useTcp ? true : false;
                 retry_count_for_event = attempt;
-                LOG(INFO) << __func__ << ": used send_dg " << resplen;
+                LOG(INFO) << __func__ << ": used send_dg " << resplen << " terrno: " << terrno;
             }
 
             const IPSockAddr& receivedServerAddr = statp->nsaddrs[actualNs];
@@ -558,18 +571,25 @@ int res_nsend(res_state statp, const uint8_t* buf, int buflen, uint8_t* ans, int
             dnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
             dnsQueryEvent->set_protocol(query_proto);
             dnsQueryEvent->set_type(getQueryType(buf, buflen));
+            dnsQueryEvent->set_linux_errno(static_cast<LinuxErrno>(terrno));
 
             // Only record stats the first time we try a query. This ensures that
             // queries that deterministically fail (e.g., a name that always returns
             // SERVFAIL or times out) do not unduly affect the stats.
             if (shouldRecordStats) {
-                res_sample sample;
-                res_stats_set_sample(&sample, query_time, *rcode, delay);
-                // KeepListening UDP mechanism is incompatible with usable_servers of legacy stats,
-                // so keep the old logic for now.
-                // TODO: Replace usable_servers of legacy stats with new one.
-                resolv_cache_add_resolver_stats_sample(statp->netid, revision_id, serverSockAddr,
-                                                       sample, params.max_samples);
+                // (b/151166599): This is a workaround to prevent that DnsResolver calculates the
+                // reliability of DNS servers from being broken when network restricted mode is
+                // enabled.
+                // TODO: Introduce the new server selection instead of skipping stats recording.
+                if (!isNetworkRestricted(terrno)) {
+                    res_sample sample;
+                    res_stats_set_sample(&sample, query_time, *rcode, delay);
+                    // KeepListening UDP mechanism is incompatible with usable_servers of legacy
+                    // stats, so keep the old logic for now.
+                    // TODO: Replace usable_servers of legacy stats with new one.
+                    resolv_cache_add_resolver_stats_sample(
+                            statp->netid, revision_id, serverSockAddr, sample, params.max_samples);
+                }
                 resolv_stats_add(statp->netid, receivedServerAddr, dnsQueryEvent);
             }
 
@@ -643,6 +663,7 @@ static int send_vc(res_state statp, res_params* params, const uint8_t* buf, int 
     // It should never happen, but just in case.
     if (ns >= statp->nsaddrs.size()) {
         LOG(ERROR) << __func__ << ": Out-of-bound indexing: " << ns;
+        *terrno = EINVAL;
         return -1;
     }
 
@@ -675,15 +696,14 @@ same_ns:
 
         statp->tcp_nssock.reset(socket(nsap->sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0));
         if (statp->tcp_nssock < 0) {
+            *terrno = errno;
+            PLOG(DEBUG) << __func__ << ": socket(vc): ";
             switch (errno) {
                 case EPROTONOSUPPORT:
                 case EPFNOSUPPORT:
                 case EAFNOSUPPORT:
-                    PLOG(DEBUG) << __func__ << ": socket(vc): ";
                     return 0;
                 default:
-                    *terrno = errno;
-                    PLOG(DEBUG) << __func__ << ": socket(vc): ";
                     return -1;
             }
         }
@@ -831,6 +851,7 @@ read_len:
         *delay = res_stats_calculate_rtt(&done, &start_time);
         *rcode = anhp->rcode;
     }
+    *terrno = 0;
     return (resplen);
 }
 
@@ -972,6 +993,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
     // It should never happen, but just in case.
     if (*ns >= statp->nsaddrs.size()) {
         LOG(ERROR) << __func__ << ": Out-of-bound indexing: " << ns;
+        *terrno = EINVAL;
         return -1;
     }
 
@@ -984,15 +1006,14 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
     if (statp->nssocks[*ns] == -1) {
         statp->nssocks[*ns].reset(socket(nsap->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0));
         if (statp->nssocks[*ns] < 0) {
+            *terrno = errno;
+            PLOG(DEBUG) << __func__ << ": socket(dg): ";
             switch (errno) {
                 case EPROTONOSUPPORT:
                 case EPFNOSUPPORT:
                 case EAFNOSUPPORT:
-                    PLOG(DEBUG) << __func__ << ": socket(dg): ";
                     return (0);
                 default:
-                    *terrno = errno;
-                    PLOG(DEBUG) << __func__ << ": socket(dg): ";
                     return (-1);
             }
         }
@@ -1001,6 +1022,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
         if (statp->_mark != MARK_UNSET) {
             if (setsockopt(statp->nssocks[*ns], SOL_SOCKET, SO_MARK, &(statp->_mark),
                            sizeof(statp->_mark)) < 0) {
+                *terrno = errno;
                 statp->closeSockets();
                 return -1;
             }
@@ -1010,11 +1032,13 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
         // ICMP port-unreachable error. This way we can detect the absence of
         // a nameserver without timing out.
         if (random_bind(statp->nssocks[*ns], nsap->sa_family) < 0) {
+            *terrno = errno;
             dump_error("bind(dg)", nsap, nsaplen);
             statp->closeSockets();
             return (0);
         }
         if (connect(statp->nssocks[*ns], nsap, (socklen_t)nsaplen) < 0) {
+            *terrno = errno;
             dump_error("connect(dg)", nsap, nsaplen);
             statp->closeSockets();
             return (0);
@@ -1022,6 +1046,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
         LOG(DEBUG) << __func__ << ": new DG socket";
     }
     if (send(statp->nssocks[*ns], (const char*)buf, (size_t)buflen, 0) != buflen) {
+        *terrno = errno;
         PLOG(DEBUG) << __func__ << ": send: ";
         statp->closeSockets();
         return 0;
@@ -1037,6 +1062,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
         if (!result.has_value()) {
             const bool isTimeout = (result.error().code() == ETIMEDOUT);
             *rcode = (isTimeout) ? RCODE_TIMEOUT : *rcode;
+            *terrno = (isTimeout) ? ETIMEDOUT : errno;
             *gotsomewhere = (isTimeout) ? 1 : *gotsomewhere;
             // Leave the UDP sockets open on timeout so we can keep listening for
             // a late response from this server while retrying on the next server.
@@ -1052,6 +1078,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
             int resplen =
                     recvfrom(fd, (char*)ans, (size_t)anssiz, 0, (sockaddr*)(void*)&from, &fromlen);
             if (resplen <= 0) {
+                *terrno = errno;
                 PLOG(DEBUG) << __func__ << ": recvfrom: ";
                 continue;
             }
@@ -1080,6 +1107,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
                 res_pquery(ans, (resplen > anssiz) ? anssiz : resplen);
                 // record the error
                 statp->_flags |= RES_F_EDNS0ERR;
+                *terrno = EREMOTEIO;
                 continue;
             }
 
@@ -1095,6 +1123,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
                 // To get the rest of answer,
                 // use TCP with same server.
                 LOG(DEBUG) << __func__ << ": truncated answer";
+                *terrno = E2BIG;
                 *v_circuit = 1;
                 return 1;
             }
@@ -1103,6 +1132,7 @@ static int send_dg(res_state statp, res_params* params, const uint8_t* buf, int 
 
             *rcode = anhp->rcode;
             *ns = receivedFromNs;
+            *terrno = 0;
             return resplen;
         }
         if (!needRetry) return 0;
